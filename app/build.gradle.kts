@@ -42,6 +42,6 @@ dependencies {
     implementation("androidx.media3:media3-exoplayer:1.2.1")
     implementation("androidx.media3:media3-ui:1.2.1")
 
-    // FIX: Change version from 6.0-2 to 6.0-2.LTS
-    implementation("com.arthenica:ffmpeg-kit-full:6.0-2.LTS")
+    // USE THIS INSTEAD (Active, maintained fork that replaces the dead arthenica packages):
+    implementation("dev.ffmpegkit-maintained:ffmpeg-kit-full:6.0.2")
 }
