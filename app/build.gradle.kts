@@ -11,13 +11,8 @@ android {
         applicationId = "com.pixelfixer"
         minSdk = 24
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
-        
-        // ADD THIS BLOCK: Force modern 64-bit architecture only
-        ndk {
-            abiFilters.add("arm64-v8a")
-        }
+        versionCode = 2
+        versionName = "2.0"
     }
 
     buildFeatures {
@@ -32,6 +27,10 @@ android {
     }
     kotlinOptions {
         jvmTarget = "17"
+        freeCompilerArgs += listOf(
+            "-opt-in=androidx.media3.common.util.UnstableApi",
+            "-opt-in=androidx.compose.material3.ExperimentalMaterial3Api"
+        )
     }
 }
 
@@ -43,10 +42,10 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.8.2")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.7.0")
 
-    // Video Player (ExoPlayer)
+    // Official Google Media3 Video Player + Hardware Video Transformer & Effects
     implementation("androidx.media3:media3-exoplayer:1.2.1")
     implementation("androidx.media3:media3-ui:1.2.1")
-
-    // Use version 8.1.7 which exists on Maven Central under dev.ffmpegkit-maintained
-    implementation("dev.ffmpegkit-maintained:ffmpeg-kit-full:8.1.7")
+    implementation("androidx.media3:media3-transformer:1.2.1")
+    implementation("androidx.media3:media3-effect:1.2.1")
+    implementation("androidx.media3:media3-common:1.2.1")
 }
