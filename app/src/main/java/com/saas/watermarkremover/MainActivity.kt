@@ -1,4 +1,4 @@
-package com.saas.pixerfixer
+package com.pixerfixer
 
 import android.net.Uri
 import android.os.Bundle
