@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace = "com.saas.pixelfixer"
+    namespace = "com.pixelfixer"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.saas.pixelfixer"
+        applicationId = "com.pixelfixer"
         minSdk = 24
         targetSdk = 34
         versionCode = 1
