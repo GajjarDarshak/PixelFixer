@@ -13,6 +13,11 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
+        
+        // ADD THIS BLOCK: Force modern 64-bit architecture only
+        ndk {
+            abiFilters.add("arm64-v8a")
+        }
     }
 
     buildFeatures {
