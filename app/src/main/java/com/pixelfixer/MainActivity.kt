@@ -10,6 +10,7 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -49,7 +50,6 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import kotlin.math.max
-import kotlin.math.min
 
 // 1. Data Model
 data class NormalizedRect(
@@ -108,11 +108,9 @@ object WatermarkProcessor {
                 val durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 5000L
                 retriever.release()
 
-                // Account for portrait rotation metadata so coordinates match the visible video 1:1
                 val videoWidth = if (rotation == 90 || rotation == 270) rawHeight else rawWidth
                 val videoHeight = if (rotation == 90 || rotation == 270) rawWidth else rawHeight
 
-                // FFmpeg delogo requires at least a 2-pixel border inside the frame edges
                 val x = (normRect.leftPercent * videoWidth).toInt().coerceIn(2, max(4, videoWidth - 16))
                 val y = (normRect.topPercent * videoHeight).toInt().coerceIn(2, max(4, videoHeight - 16))
                 val w = (normRect.widthPercent * videoWidth).toInt().coerceIn(8, max(8, videoWidth - x - 4))
@@ -120,7 +118,6 @@ object WatermarkProcessor {
 
                 mainHandler.post { onProgress(10, "Erasing watermark (${w}x${h}px)...") }
 
-                // Use built-in mpeg4 encoder (-c:v mpeg4 -q:v 2) so it works on 100% of Android phones
                 val cmd = "-y -i \"${inputFile.absolutePath}\" -vf \"delogo=x=$x:y=$y:w=$w:h=$h:show=0\" -c:v mpeg4 -q:v 2 -c:a copy \"${outputFile.absolutePath}\""
 
                 FFmpegKit.executeAsync(
@@ -354,7 +351,6 @@ fun VideoEditorScreen(
         onDispose { exoPlayer.release() }
     }
 
-    // Percentage Progress Dialog
     if (isProcessing) {
         AlertDialog(
             onDismissRequest = { },
@@ -383,7 +379,6 @@ fun VideoEditorScreen(
         )
     }
 
-    // Error Dialog (if anything goes wrong, you will see the exact reason)
     if (errorDialogMessage != null) {
         AlertDialog(
             onDismissRequest = { errorDialogMessage = null },
@@ -396,7 +391,6 @@ fun VideoEditorScreen(
     }
 
     Column(modifier = Modifier.fillMaxSize().padding(12.dp)) {
-        // Video + Locked Aspect-Ratio Overlay Box
         Box(
             modifier = Modifier
                 .weight(1f)
@@ -457,14 +451,12 @@ fun VideoEditorScreen(
 
         Spacer(Modifier.height(10.dp))
 
-        // Quick Preset Buttons for Gemini Watermark
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             FilledTonalButton(
                 onClick = {
-                    // Bottom-Right Gemini Watermark Preset
                     boxWidth = 0.26f
                     boxHeight = 0.12f
                     boxLeft = 0.72f
@@ -477,7 +469,6 @@ fun VideoEditorScreen(
             }
             FilledTonalButton(
                 onClick = {
-                    // Top-Right Preset
                     boxWidth = 0.26f
                     boxHeight = 0.12f
                     boxLeft = 0.72f
@@ -553,112 +544,6 @@ fun VideoEditorScreen(
     }
 }
 
-// 5. My Studio Screen with Built-in Video Player to Verify Cleaned Video Immediately
-@Composable
-fun StudioGalleryScreen(files: List<File>) {
-    val context = LocalContext.current
-    var selectedFile by remember { mutableStateOf(files.firstOrNull()) }
-
-    LaunchedEffect(files.size) {
-        if (files.isNotEmpty()) {
-            selectedFile = files.first()
-        }
-    }
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(16.dp)
-            .verticalScroll(rememberScrollState())
-    ) {
-        Text("My Studio (Cleaned Videos)", fontSize = 20.sp, fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(8.dp))
-
-        if (files.isEmpty()) {
-            Text(
-                "No videos cleaned yet. Go to the Editor tab, select a Gemini video, and tap Remove Watermark!",
-                color = Color.Gray
-            )
-        } else {
-            Text(
-                "✅ Also saved to your phone's Gallery under Movies/PixelFixer!",
-                color = Color(0xFF4CAF50),
-                fontSize = 13.sp,
-                fontWeight = FontWeight.SemiBold
-            )
-            Spacer(Modifier.height(12.dp))
-
-            // Preview Player for the Cleaned Video
-            selectedFile?.let { file ->
-                val previewPlayer = remember(file.absolutePath) {
-                    ExoPlayer.Builder(context).build().apply {
-                        setMediaItem(MediaItem.fromUri(Uri.fromFile(file)))
-                        repeatMode = ExoPlayer.REPEAT_MODE_ALL
-                        prepare()
-                        playWhenReady = true
-                    }
-                }
-                DisposableEffect(previewPlayer) {
-                    onDispose { previewPlayer.release() }
-                }
-
-                Card(modifier = Modifier.fillMaxWidth()) {
-                    Column(modifier = Modifier.padding(12.dp)) {
-                        Text("Now Playing Cleaned Video:", fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                        Spacer(Modifier.height(8.dp))
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(320.dp)
-                                .background(Color.Black, RoundedCornerShape(8.dp))
-                        ) {
-                            AndroidView(
-                                factory = { ctx ->
-                                    PlayerView(ctx).apply {
-                                        player = previewPlayer
-                                        useController = true
-                                    }
-                                },
-                                modifier = Modifier.fillMaxSize()
-                            )
-                        }
-                    }
-                }
-            }
-
-            Spacer(Modifier.height(16.dp))
-            Text("Processed History:", fontWeight = FontWeight.Bold)
-            files.forEach { file ->
-                Card(
-                    onClick = { selectedFile = file },
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
-                ) {
-                    Column(modifier = Modifier.padding(12.dp)) {
-                        Text(file.name, fontWeight = FontWeight.Bold)
-                        Text("Tap to preview above", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-fun ProPlanScreen() {
-    Column(modifier = Modifier.fillMaxWidth().padding(24.dp)) {
-        Text("Unlock PixelFixer PRO ✨", fontSize = 24.sp, fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(12.dp))
-        Text("• Cloud AI Generative Inpainting")
-        Text("• Batch Process up to 20 Reels/Shorts at once")
-        Text("• 4K 60fps Original Quality Export")
-        Text("• 100% Ad-Free Experience")
-        Spacer(Modifier.height(20.dp))
-        Button(onClick = { }, modifier = Modifier.fillMaxWidth()) {
-            Text("Start 3-Day Free Trial (Then ₹299/month)")
-        }
-    }
-}
-
 // 5. My Studio Screen with Video Preview + "Save to Any Folder" Picker
 @Composable
 fun StudioGalleryScreen(files: List<File>) {
@@ -666,7 +551,6 @@ fun StudioGalleryScreen(files: List<File>) {
     var selectedFile by remember { mutableStateOf(files.firstOrNull()) }
     var saveStatusText by remember { mutableStateOf("✅ Auto-saved to Gallery (Movies/PixelFixer)") }
 
-    // Android System Folder & File Picker ("Save As...")
     val saveToCustomFolderLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("video/mp4")
     ) { destinationUri: Uri? ->
@@ -678,7 +562,7 @@ fun StudioGalleryScreen(files: List<File>) {
                     }
                 }
                 saveStatusText = "✅ Successfully saved to your chosen folder!"
-                android.widget.Toast.makeText(context, "Saved to selected folder!", android.widget.Toast.LENGTH_LONG).show()
+                Toast.makeText(context, "Saved to selected folder!", Toast.LENGTH_LONG).show()
             } catch (e: Exception) {
                 saveStatusText = "❌ Failed to save: ${e.localizedMessage}"
             }
@@ -714,7 +598,6 @@ fun StudioGalleryScreen(files: List<File>) {
             )
             Spacer(Modifier.height(12.dp))
 
-            // Preview Player for the Cleaned Video
             selectedFile?.let { file ->
                 val previewPlayer = remember(file.absolutePath) {
                     ExoPlayer.Builder(context).build().apply {
@@ -751,7 +634,6 @@ fun StudioGalleryScreen(files: List<File>) {
 
                         Spacer(Modifier.height(12.dp))
 
-                        // Button to pick ANY folder on the phone and save the video there
                         Button(
                             onClick = {
                                 saveToCustomFolderLauncher.launch(file.name)
@@ -779,6 +661,22 @@ fun StudioGalleryScreen(files: List<File>) {
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+fun ProPlanScreen() {
+    Column(modifier = Modifier.fillMaxWidth().padding(24.dp)) {
+        Text("Unlock PixelFixer PRO ✨", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(12.dp))
+        Text("• Cloud AI Generative Inpainting")
+        Text("• Batch Process up to 20 Reels/Shorts at once")
+        Text("• 4K 60fps Original Quality Export")
+        Text("• 100% Ad-Free Experience")
+        Spacer(Modifier.height(20.dp))
+        Button(onClick = { }, modifier = Modifier.fillMaxWidth()) {
+            Text("Start 3-Day Free Trial (Then ₹299/month)")
         }
     }
 }
