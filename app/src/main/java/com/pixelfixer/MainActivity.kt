@@ -4,6 +4,8 @@ import android.content.Context
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -38,7 +40,9 @@ import com.arthenica.ffmpegkit.FFmpegKit
 import com.arthenica.ffmpegkit.ReturnCode
 import java.io.File
 import java.io.FileOutputStream
+import kotlin.math.max
 
+// 1. Data Model
 data class NormalizedRect(
     val leftPercent: Float,
     val topPercent: Float,
@@ -46,6 +50,7 @@ data class NormalizedRect(
     val heightPercent: Float
 )
 
+// 2. Background Video Processor (Fixed Thread Crashing)
 object WatermarkProcessor {
     fun removeWatermark(
         context: Context,
@@ -54,43 +59,59 @@ object WatermarkProcessor {
         onProgress: (String) -> Unit,
         onResult: (Boolean, File?, String) -> Unit
     ) {
-        try {
-            val inputFile = File(context.cacheDir, "input_video.mp4")
-            context.contentResolver.openInputStream(inputUri)?.use { input ->
-                FileOutputStream(inputFile).use { output -> input.copyTo(output) }
-            }
+        val mainHandler = Handler(Looper.getMainLooper())
 
-            val outputFile = File(context.getExternalFilesDir(null), "cleaned_${System.currentTimeMillis()}.mp4")
-
-            val retriever = MediaMetadataRetriever()
-            retriever.setDataSource(context, inputUri)
-            val videoWidth = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toInt() ?: 1080
-            val videoHeight = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toInt() ?: 1920
-            retriever.release()
-
-            val x = (normRect.leftPercent * videoWidth).toInt().coerceIn(2, videoWidth - 20)
-            val y = (normRect.topPercent * videoHeight).toInt().coerceIn(2, videoHeight - 20)
-            val w = (normRect.widthPercent * videoWidth).toInt().coerceIn(10, videoWidth - x - 2)
-            val h = (normRect.heightPercent * videoHeight).toInt().coerceIn(10, videoHeight - y - 2)
-
-            val cmd = "-y -i \"${inputFile.absolutePath}\" -vf \"delogo=x=$x:y=$y:w=$w:h=$h:show=0\" -c:a copy \"${outputFile.absolutePath}\""
-
-            FFmpegKit.executeAsync(cmd, { session ->
-                if (ReturnCode.isSuccess(session.returnCode)) {
-                    onResult(true, outputFile, "Saved to: ${outputFile.absolutePath}")
-                } else {
-                    onResult(false, null, "Error: ${session.failStackTrace ?: "FFmpeg failed"}")
+        // Run the heavy lifting in a background thread so the UI never freezes
+        Thread {
+            try {
+                val inputFile = File(context.cacheDir, "input_video.mp4")
+                context.contentResolver.openInputStream(inputUri)?.use { input ->
+                    FileOutputStream(inputFile).use { output -> input.copyTo(output) }
                 }
-            }, { log ->
-                onProgress(log.message)
-            }, { _ -> })
 
-        } catch (e: Exception) {
-            onResult(false, null, e.localizedMessage ?: "Unknown Error")
-        }
+                val outputFile = File(context.getExternalFilesDir(null), "cleaned_${System.currentTimeMillis()}.mp4")
+
+                val retriever = MediaMetadataRetriever()
+                retriever.setDataSource(inputFile.absolutePath)
+                val videoWidth = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toInt() ?: 1080
+                val videoHeight = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toInt() ?: 1920
+                retriever.release()
+
+                // Safe bounding box math (prevents crashes near screen edges)
+                val x = (normRect.leftPercent * videoWidth).toInt().coerceIn(2, videoWidth - 20)
+                val y = (normRect.topPercent * videoHeight).toInt().coerceIn(2, videoHeight - 20)
+                
+                val maxW = max(10, videoWidth - x - 2)
+                val maxH = max(10, videoHeight - y - 2)
+                
+                val w = (normRect.widthPercent * videoWidth).toInt().coerceIn(10, maxW)
+                val h = (normRect.heightPercent * videoHeight).toInt().coerceIn(10, maxH)
+
+                val cmd = "-y -i \"${inputFile.absolutePath}\" -vf \"delogo=x=$x:y=$y:w=$w:h=$h:show=0\" -c:a copy \"${outputFile.absolutePath}\""
+
+                FFmpegKit.executeAsync(cmd, { session ->
+                    // Safely jump back to the Main UI Thread before updating the screen
+                    mainHandler.post {
+                        if (ReturnCode.isSuccess(session.returnCode)) {
+                            onResult(true, outputFile, "Saved to: My Studio tab")
+                        } else {
+                            onResult(false, null, "Error: ${session.failStackTrace ?: "FFmpeg failed"}")
+                        }
+                    }
+                }, { log ->
+                    mainHandler.post { onProgress(log.message) }
+                }, { _ -> })
+
+            } catch (e: Exception) {
+                mainHandler.post {
+                    onResult(false, null, e.localizedMessage ?: "Unknown Error")
+                }
+            }
+        }.start()
     }
 }
 
+// 3. Main Application Class
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -102,6 +123,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+// 4. UI Navigation & Screens
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun WatermarkRemoverApp() {
@@ -151,7 +173,7 @@ fun WatermarkRemoverApp() {
                     selected = currentTab == 2,
                     onClick = { currentTab = 2 },
                     icon = { Icon(Icons.Default.WorkspacePremium, null) },
-                    label = { Text("Monetize / Pro") }
+                    label = { Text("Pro") }
                 )
             }
         }
@@ -335,13 +357,14 @@ fun VideoEditorScreen(
                 enabled = !isProcessing,
                 onClick = {
                     isProcessing = true
-                    statusMessage = "Removing watermark via FFmpeg delogo..."
+                    statusMessage = "Processing video in background..."
+                    
                     WatermarkProcessor.removeWatermark(
                         context = context,
                         inputUri = videoUri,
                         normRect = NormalizedRect(boxLeft, boxTop, boxWidth, boxHeight),
-                        onProgress = { logMsg: String -> },
-                        onResult = { success: Boolean, file: File?, msg: String ->
+                        onProgress = { logMsg -> },
+                        onResult = { success, file, msg ->
                             isProcessing = false
                             statusMessage = msg
                             if (success && file != null) onSuccess(file)
@@ -372,7 +395,7 @@ fun StudioGalleryScreen(files: List<File>) {
                 Card(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
                     Column(modifier = Modifier.padding(16.dp)) {
                         Text(file.name, fontWeight = FontWeight.Bold)
-                        Text(file.absolutePath, fontSize = 12.sp, color = Color.Gray)
+                        Text("Saved to: ${file.absolutePath}", fontSize = 12.sp, color = Color.Gray)
                     }
                 }
             }
