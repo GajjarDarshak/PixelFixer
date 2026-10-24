@@ -1,7 +1,14 @@
+@file:OptIn(
+    androidx.media3.common.util.UnstableApi::class,
+    androidx.compose.material3.ExperimentalMaterial3Api::class
+)
+
 package com.pixelfixer
 
 import android.content.ContentValues
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Color as AndroidColor
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
@@ -41,17 +48,28 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.media3.common.Effect
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
+import androidx.media3.effect.BitmapOverlay
+import androidx.media3.effect.OverlayEffect
+import androidx.media3.effect.TextureOverlay
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.transformer.Composition
+import androidx.media3.transformer.EditedMediaItem
+import androidx.media3.transformer.Effects
+import androidx.media3.transformer.ExportException
+import androidx.media3.transformer.ExportResult
+import androidx.media3.transformer.ProgressHolder
+import androidx.media3.transformer.Transformer
 import androidx.media3.ui.PlayerView
-import com.arthenica.ffmpegkit.FFmpegKit
-import com.arthenica.ffmpegkit.ReturnCode
+import com.google.common.collect.ImmutableList
 import java.io.File
 import java.io.FileInputStream
-import java.io.FileOutputStream
 import kotlin.math.max
+import kotlin.math.min
 
-// 1. Data Model
+// 1. Normalized Watermark Box Coordinates (0.0 to 1.0)
 data class NormalizedRect(
     val leftPercent: Float,
     val topPercent: Float,
@@ -59,7 +77,7 @@ data class NormalizedRect(
     val heightPercent: Float
 )
 
-// 2. Video Processor with Live 0% - 100% Progress & Gallery Export
+// 2. Official Google Media3 Watermark Remover (Zero FFmpeg Dependencies)
 object WatermarkProcessor {
 
     fun getVideoAspectRatio(context: Context, uri: Uri): Float {
@@ -89,72 +107,216 @@ object WatermarkProcessor {
 
         Thread {
             try {
-                mainHandler.post { onProgress(2, "Copying video file...") }
-
-                val inputFile = File(context.cacheDir, "input_video.mp4")
-                context.contentResolver.openInputStream(inputUri)?.use { input ->
-                    FileOutputStream(inputFile).use { output -> input.copyTo(output) }
-                }
-
-                val outputFile = File(context.getExternalFilesDir(null), "PixelFixer_${System.currentTimeMillis()}.mp4")
-
-                mainHandler.post { onProgress(5, "Reading video dimensions...") }
+                mainHandler.post { onProgress(3, "Analyzing video dimensions...") }
 
                 val retriever = MediaMetadataRetriever()
-                retriever.setDataSource(inputFile.absolutePath)
-                val rawWidth = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 1280
-                val rawHeight = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 720
+                retriever.setDataSource(context, inputUri)
+                val rawWidth = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 1080
+                val rawHeight = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 1920
                 val rotation = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
                 val durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 5000L
-                retriever.release()
 
                 val videoWidth = if (rotation == 90 || rotation == 270) rawHeight else rawWidth
                 val videoHeight = if (rotation == 90 || rotation == 270) rawWidth else rawHeight
 
-                val x = (normRect.leftPercent * videoWidth).toInt().coerceIn(2, max(4, videoWidth - 16))
-                val y = (normRect.topPercent * videoHeight).toInt().coerceIn(2, max(4, videoHeight - 16))
-                val w = (normRect.widthPercent * videoWidth).toInt().coerceIn(8, max(8, videoWidth - x - 4))
-                val h = (normRect.heightPercent * videoHeight).toInt().coerceIn(8, max(8, videoHeight - y - 4))
+                // Calculate exact watermark pixel box inside the video frame
+                val boxX = (normRect.leftPercent * videoWidth).toInt().coerceIn(2, max(4, videoWidth - 16))
+                val boxY = (normRect.topPercent * videoHeight).toInt().coerceIn(2, max(4, videoHeight - 16))
+                val boxW = (normRect.widthPercent * videoWidth).toInt().coerceIn(8, max(8, videoWidth - boxX - 2))
+                val boxH = (normRect.heightPercent * videoHeight).toInt().coerceIn(8, max(8, videoHeight - boxY - 2))
 
-                mainHandler.post { onProgress(10, "Erasing watermark (${w}x${h}px)...") }
+                // Sample 8 keyframes across the video to build seamless Delogo Inpaint patches
+                val numSamples = 8
+                val patchFrames = ArrayList<IntArray>(numSamples)
 
-                val cmd = "-y -i \"${inputFile.absolutePath}\" -vf \"delogo=x=$x:y=$y:w=$w:h=$h:show=0\" -c:v mpeg4 -q:v 2 -c:a copy \"${outputFile.absolutePath}\""
+                for (i in 0 until numSamples) {
+                    val sampleTimeUs = ((durationMs * 1000L * i) / numSamples).coerceAtLeast(0L)
+                    val pct = 5 + ((i + 1) * 20 / numSamples)
+                    mainHandler.post {
+                        onProgress(pct, "Inpainting background pixels (${i + 1}/$numSamples)...")
+                    }
 
-                FFmpegKit.executeAsync(
-                    cmd,
-                    { session ->
-                        if (ReturnCode.isSuccess(session.returnCode) && outputFile.exists() && outputFile.length() > 0) {
-                            val galleryMsg = saveToPhoneGallery(context, outputFile)
-                            mainHandler.post {
-                                onProgress(100, "100% Complete!")
-                                onResult(true, outputFile, galleryMsg)
-                            }
+                    val frameBmp = retriever.getFrameAtTime(sampleTimeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    if (frameBmp != null) {
+                        val scaledFrame = if (frameBmp.width != videoWidth || frameBmp.height != videoHeight) {
+                            Bitmap.createScaledBitmap(frameBmp, videoWidth, videoHeight, true)
                         } else {
-                            val logs = session.allLogsAsString ?: "Unknown FFmpeg error"
-                            val shortErr = if (logs.length > 250) logs.takeLast(250) else logs
-                            mainHandler.post {
-                                onResult(false, null, "FFmpeg Error:\n$shortErr")
-                            }
+                            frameBmp
                         }
-                    },
-                    { _ -> },
-                    { stats ->
-                        val processedMs = stats.time.toDouble()
-                        if (durationMs > 0 && processedMs > 0) {
-                            val rawPct = ((processedMs / durationMs.toDouble()) * 90.0).toInt()
-                            val pct = (10 + rawPct).coerceIn(10, 99)
-                            mainHandler.post {
-                                onProgress(pct, "Removing watermark... $pct%")
+                        patchFrames.add(createDelogoPatch(scaledFrame, boxX, boxY, boxW, boxH))
+                        if (scaledFrame !== frameBmp) scaledFrame.recycle()
+                        frameBmp.recycle()
+                    }
+                }
+                retriever.release()
+
+                if (patchFrames.isEmpty()) {
+                    val fallbackPatch = IntArray(boxW * boxH) { AndroidColor.argb(255, 24, 24, 24) }
+                    patchFrames.add(fallbackPatch)
+                }
+
+                // Create a single transparent overlay frame and write the first inpainted patch into it
+                val overlayBitmap = Bitmap.createBitmap(videoWidth, videoHeight, Bitmap.Config.ARGB_8888)
+                var currentPatchIndex = -1
+
+                val dynamicDelogoOverlay = object : BitmapOverlay() {
+                    override fun getBitmap(presentationTimeUs: Long): Bitmap {
+                        val durationUs = max(1000L, durationMs * 1000L)
+                        val idx = ((presentationTimeUs.toDouble() / durationUs.toDouble()) * patchFrames.size)
+                            .toInt()
+                            .coerceIn(0, patchFrames.size - 1)
+
+                        if (idx != currentPatchIndex) {
+                            currentPatchIndex = idx
+                            val pixels = patchFrames[idx]
+                            overlayBitmap.setPixels(pixels, 0, boxW, boxX, boxY, boxW, boxH)
+                        }
+                        return overlayBitmap
+                    }
+                }
+
+                val outputFile = File(
+                    context.getExternalFilesDir(null),
+                    "PixelFixer_${System.currentTimeMillis()}.mp4"
+                )
+                if (outputFile.exists()) outputFile.delete()
+
+                // Start Google Media3 Hardware Transformer on the Main Thread
+                mainHandler.post {
+                    onProgress(28, "Starting hardware video encoder...")
+
+                    val overlayEffect = OverlayEffect(ImmutableList.of<TextureOverlay>(dynamicDelogoOverlay))
+                    val effects = Effects(emptyList(), listOf<Effect>(overlayEffect))
+                    val editedMediaItem = EditedMediaItem.Builder(MediaItem.fromUri(inputUri))
+                        .setEffects(effects)
+                        .build()
+
+                    var isFinished = false
+
+                    val transformer = Transformer.Builder(context)
+                        .setVideoMimeType(MimeTypes.VIDEO_H264)
+                        .addListener(object : Transformer.Listener {
+                            override fun onCompleted(composition: Composition, exportResult: ExportResult) {
+                                isFinished = true
+                                overlayBitmap.recycle()
+                                Thread {
+                                    val galleryMsg = saveToPhoneGallery(context, outputFile)
+                                    mainHandler.post {
+                                        onProgress(100, "100% Complete!")
+                                        onResult(true, outputFile, galleryMsg)
+                                    }
+                                }.start()
+                            }
+
+                            override fun onError(
+                                composition: Composition,
+                                exportResult: ExportResult,
+                                exportException: ExportException
+                            ) {
+                                isFinished = true
+                                overlayBitmap.recycle()
+                                mainHandler.post {
+                                    onResult(
+                                        false,
+                                        null,
+                                        "Encoder Error (${exportException.errorCodeName}): ${exportException.localizedMessage}"
+                                    )
+                                }
+                            }
+                        })
+                        .build()
+
+                    transformer.start(editedMediaItem, outputFile.absolutePath)
+
+                    // Poll live 0-100% hardware encoding progress every 200ms
+                    val progressHolder = ProgressHolder()
+                    val progressRunnable = object : Runnable {
+                        override fun run() {
+                            if (isFinished) return
+                            val state = transformer.getProgress(progressHolder)
+                            if (state == Transformer.PROGRESS_STATE_AVAILABLE) {
+                                val mappedPct = (28 + (progressHolder.progress * 71 / 100)).coerceIn(28, 99)
+                                onProgress(mappedPct, "Removing watermark... $mappedPct%")
+                            }
+                            if (state != Transformer.PROGRESS_STATE_NOT_STARTED && !isFinished) {
+                                mainHandler.postDelayed(this, 200L)
                             }
                         }
                     }
-                )
+                    mainHandler.postDelayed(progressRunnable, 200L)
+                }
+
             } catch (e: Throwable) {
                 mainHandler.post {
-                    onResult(false, null, "Error: ${e.localizedMessage ?: "Failed to process video"}")
+                    onResult(false, null, "Error (${e.javaClass.simpleName}): ${e.localizedMessage ?: "Unknown error"}")
                 }
             }
         }.start()
+    }
+
+    /**
+     * True 2D Bilinear Delogo Interpolation:
+     * Samples the clean border pixels surrounding the watermark box (top, bottom, left, right)
+     * and smoothly interpolates them across the box so the watermark disappears seamlessly.
+     */
+    private fun createDelogoPatch(frame: Bitmap, boxX: Int, boxY: Int, boxW: Int, boxH: Int): IntArray {
+        val patch = IntArray(boxW * boxH)
+        val imgW = frame.width
+        val imgH = frame.height
+
+        val leftX = (boxX - 2).coerceIn(0, imgW - 1)
+        val rightX = (boxX + boxW + 1).coerceIn(0, imgW - 1)
+        val topY = (boxY - 2).coerceIn(0, imgH - 1)
+        val bottomY = (boxY + boxH + 1).coerceIn(0, imgH - 1)
+
+        val topRow = IntArray(boxW) { dx -> frame.getPixel((boxX + dx).coerceIn(0, imgW - 1), topY) }
+        val bottomRow = IntArray(boxW) { dx -> frame.getPixel((boxX + dx).coerceIn(0, imgW - 1), bottomY) }
+        val leftCol = IntArray(boxH) { dy -> frame.getPixel(leftX, (boxY + dy).coerceIn(0, imgH - 1)) }
+        val rightCol = IntArray(boxH) { dy -> frame.getPixel(rightX, (boxY + dy).coerceIn(0, imgH - 1)) }
+
+        for (dy in 0 until boxH) {
+            val v = (dy + 1).toFloat() / (boxH + 1).toFloat()
+            val distV = min(v, 1f - v)
+            val leftPx = leftCol[dy]
+            val rightPx = rightCol[dy]
+
+            for (dx in 0 until boxW) {
+                val u = (dx + 1).toFloat() / (boxW + 1).toFloat()
+                val distU = min(u, 1f - u)
+
+                val topPx = topRow[dx]
+                val bottomPx = bottomRow[dx]
+
+                // Inverse-distance weights to the 4 clean edges
+                val wLeft = 1f / max(0.02f, u)
+                val wRight = 1f / max(0.02f, 1f - u)
+                val wTop = 1f / max(0.02f, v)
+                val wBottom = 1f / max(0.02f, 1f - v)
+                val totalW = wLeft + wRight + wTop + wBottom
+
+                val r = ((AndroidColor.red(leftPx) * wLeft +
+                        AndroidColor.red(rightPx) * wRight +
+                        AndroidColor.red(topPx) * wTop +
+                        AndroidColor.red(bottomPx) * wBottom) / totalW).toInt().coerceIn(0, 255)
+
+                val g = ((AndroidColor.green(leftPx) * wLeft +
+                        AndroidColor.green(rightPx) * wRight +
+                        AndroidColor.green(topPx) * wTop +
+                        AndroidColor.green(bottomPx) * wBottom) / totalW).toInt().coerceIn(0, 255)
+
+                val b = ((AndroidColor.blue(leftPx) * wLeft +
+                        AndroidColor.blue(rightPx) * wRight +
+                        AndroidColor.blue(topPx) * wTop +
+                        AndroidColor.blue(bottomPx) * wBottom) / totalW).toInt().coerceIn(0, 255)
+
+                // Smoothly feather the outer 6% edge so there is no hard rectangle line
+                val edgeFactor = (min(distU, distV) / 0.06f).coerceIn(0.25f, 1f)
+                val alpha = (edgeFactor * 255f).toInt().coerceIn(0, 255)
+
+                patch[dy * boxW + dx] = AndroidColor.argb(alpha, r, g, b)
+            }
+        }
+        return patch
     }
 
     private fun saveToPhoneGallery(context: Context, videoFile: File): String {
@@ -204,7 +366,6 @@ class MainActivity : ComponentActivity() {
 }
 
 // 4. App Navigation
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun WatermarkRemoverApp() {
     var currentTab by remember { mutableIntStateOf(0) }
@@ -301,9 +462,18 @@ fun HomeDashboard(onPickVideo: () -> Unit) {
             tint = MaterialTheme.colorScheme.primary
         )
         Spacer(Modifier.height(16.dp))
-        Text("PixelFixer: Gemini & Video Eraser", fontSize = 22.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
+        Text(
+            "PixelFixer: Gemini & Video Eraser",
+            fontSize = 22.sp,
+            fontWeight = FontWeight.Bold,
+            textAlign = TextAlign.Center
+        )
         Spacer(Modifier.height(8.dp))
-        Text("Select any Gemini or social video to remove its corner watermark.", color = Color.Gray, textAlign = TextAlign.Center)
+        Text(
+            "Powered by Google Media3 Hardware Engine. Select any video to erase its corner watermark.",
+            color = Color.Gray,
+            textAlign = TextAlign.Center
+        )
         Spacer(Modifier.height(32.dp))
         Button(
             onClick = onPickVideo,
@@ -515,7 +685,7 @@ fun VideoEditorScreen(
                     exoPlayer.pause()
                     isProcessing = true
                     progressPercent = 1
-                    statusMessage = "Starting watermark removal..."
+                    statusMessage = "Starting Media3 Engine..."
 
                     WatermarkProcessor.removeWatermark(
                         context = context,
