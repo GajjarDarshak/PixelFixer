@@ -7,10 +7,10 @@ package com.pixelfixer
 
 import android.content.ContentValues
 import android.content.Context
-import android.graphics.Bitmap
-import android.graphics.Color as AndroidColor
+import android.content.Intent
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.opengl.GLES20
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
@@ -35,6 +35,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
@@ -51,9 +52,11 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.Effect
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
-import androidx.media3.effect.BitmapOverlay
-import androidx.media3.effect.OverlayEffect
-import androidx.media3.effect.TextureOverlay
+import androidx.media3.common.VideoFrameProcessingException
+import androidx.media3.common.util.GlProgram
+import androidx.media3.common.util.GlUtil
+import androidx.media3.effect.BaseGlShaderProgram
+import androidx.media3.effect.GlEffect
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.transformer.Composition
 import androidx.media3.transformer.EditedMediaItem
@@ -63,13 +66,11 @@ import androidx.media3.transformer.ExportResult
 import androidx.media3.transformer.ProgressHolder
 import androidx.media3.transformer.Transformer
 import androidx.media3.ui.PlayerView
-import com.google.common.collect.ImmutableList
 import java.io.File
 import java.io.FileInputStream
 import kotlin.math.max
-import kotlin.math.min
 
-// 1. Normalized Watermark Box Coordinates (0.0 to 1.0)
+// 1. Watermark Selection Area (0.0 to 1.0)
 data class NormalizedRect(
     val leftPercent: Float,
     val topPercent: Float,
@@ -77,7 +78,181 @@ data class NormalizedRect(
     val heightPercent: Float
 )
 
-// 2. Official Google Media3 Watermark Remover (Zero FFmpeg Dependencies)
+// 2. Processed Video Item (File + Shareable MediaStore URI for WhatsApp/Instagram)
+data class ProcessedVideo(
+    val file: File,
+    val shareUri: Uri?
+)
+
+// 3. Per-Frame OpenGL GPU Watermark Eraser (Zero Box, Feathered Live Inpainting)
+class DelogoGlEffect(
+    private val normRect: NormalizedRect,
+    private val removalMode: Int // 0 = Seamless Feather Erase, 1 = Smart Corner Zoom
+) : GlEffect {
+    override fun toGlShaderProgram(context: Context, useHdr: Boolean): BaseGlShaderProgram {
+        return DelogoShaderProgram(useHdr, normRect, removalMode)
+    }
+}
+
+class DelogoShaderProgram(
+    useHdr: Boolean,
+    normRect: NormalizedRect,
+    removalMode: Int
+) : BaseGlShaderProgram(useHdr, 1) {
+
+    private val glProgram: GlProgram
+
+    init {
+        try {
+            glProgram = GlProgram(VERTEX_SHADER, FRAGMENT_SHADER)
+            glProgram.setBufferAttribute(
+                "aFramePosition",
+                GlUtil.getNormalizedCoordinateBounds(),
+                GlUtil.HOMOGENEOUS_COORDINATE_VECTOR_SIZE
+            )
+
+            // Convert UI top-left coordinates (0..1) to OpenGL bottom-left UV coordinates (0..1)
+            val glLeft = normRect.leftPercent.coerceIn(0.005f, 0.98f)
+            val glRight = (normRect.leftPercent + normRect.widthPercent).coerceIn(glLeft + 0.02f, 0.995f)
+            val glTop = (1f - normRect.topPercent).coerceIn(0.02f, 0.995f)
+            val glBottom = (1f - (normRect.topPercent + normRect.heightPercent)).coerceIn(0.005f, glTop - 0.02f)
+
+            glProgram.setFloatUniform("uLeft", glLeft)
+            glProgram.setFloatUniform("uRight", glRight)
+            glProgram.setFloatUniform("uBottom", glBottom)
+            glProgram.setFloatUniform("uTop", glTop)
+            glProgram.setFloatUniform("uMode", if (removalMode == 1) 1.0f else 0.0f)
+        } catch (e: Exception) {
+            throw VideoFrameProcessingException(e)
+        }
+    }
+
+    override fun configure(inputWidth: Int, inputHeight: Int): androidx.media3.common.util.Size {
+        return androidx.media3.common.util.Size(inputWidth, inputHeight)
+    }
+
+    override fun drawFrame(inputTexId: Int, presentationTimeUs: Long) {
+        try {
+            glProgram.use()
+            glProgram.setSamplerTexIdUniform("uTexSampler", inputTexId, 0)
+            glProgram.bindAttributesAndUniforms()
+            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        } catch (e: GlUtil.GlException) {
+            throw VideoFrameProcessingException(e, presentationTimeUs)
+        }
+    }
+
+    override fun release() {
+        super.release()
+        try {
+            glProgram.delete()
+        } catch (e: GlUtil.GlException) {
+            throw VideoFrameProcessingException(e)
+        }
+    }
+
+    companion object {
+        private const val VERTEX_SHADER = """
+            attribute vec4 aFramePosition;
+            varying vec2 vTexSamplingCoord;
+            void main() {
+                gl_Position = aFramePosition;
+                vTexSamplingCoord = vec2(aFramePosition.x * 0.5 + 0.5, aFramePosition.y * 0.5 + 0.5);
+            }
+        """
+
+        // Per-frame GPU Inpainting Shader:
+        // - Samples clean pixels outside the watermark on EVERY frame
+        // - Automatically ignores screen edges when erasing corner watermarks (like Gemini)
+        // - Uses an elliptical smoothstep feather so there is NEVER a visible box outline
+        private const val FRAGMENT_SHADER = """
+            precision highp float;
+            varying vec2 vTexSamplingCoord;
+            uniform sampler2D uTexSampler;
+            uniform float uLeft;
+            uniform float uRight;
+            uniform float uBottom;
+            uniform float uTop;
+            uniform float uMode;
+
+            vec4 sampleSmoothBorder(vec2 uv, vec2 dir, float span) {
+                vec4 c1 = texture2D(uTexSampler, clamp(uv - dir * span, 0.002, 0.998));
+                vec4 c2 = texture2D(uTexSampler, clamp(uv, 0.002, 0.998));
+                vec4 c3 = texture2D(uTexSampler, clamp(uv + dir * span, 0.002, 0.998));
+                return (c1 + c2 * 2.0 + c3) * 0.25;
+            }
+
+            void main() {
+                vec2 uv = vTexSamplingCoord;
+
+                // Mode 1: Smart Corner Zoom (pushes corner watermark outside frame with 0% blur)
+                if (uMode > 0.5) {
+                    float boxW = uRight - uLeft;
+                    float boxH = uTop - uBottom;
+                    float zoom = max(boxW, boxH) * 1.05;
+                    vec2 anchor = vec2(
+                        (uLeft + uRight) > 1.0 ? 0.0 : 1.0,
+                        (uBottom + uTop) < 1.0 ? 1.0 : 0.0
+                    );
+                    vec2 zoomedUv = anchor + (uv - anchor) * (1.0 - zoom);
+                    gl_FragColor = texture2D(uTexSampler, clamp(zoomedUv, 0.001, 0.999));
+                    return;
+                }
+
+                // Mode 0: Seamless Per-Frame Feathered Inpaint
+                vec4 origColor = texture2D(uTexSampler, uv);
+
+                if (uv.x < uLeft || uv.x > uRight || uv.y < uBottom || uv.y > uTop) {
+                    gl_FragColor = origColor;
+                    return;
+                }
+
+                float w = max(0.005, uRight - uLeft);
+                float h = max(0.005, uTop - uBottom);
+                float u = clamp((uv.x - uLeft) / w, 0.0, 1.0);
+                float v = clamp((uv.y - uBottom) / h, 0.0, 1.0);
+
+                // Sample clean background just outside the box
+                float pad = 0.008;
+                float lX = max(0.003, uLeft - pad);
+                float rX = min(0.997, uRight + pad);
+                float bY = max(0.003, uBottom - pad);
+                float tY = min(0.997, uTop + pad);
+
+                vec4 colLeft   = sampleSmoothBorder(vec2(lX, uv.y), vec2(0.0, 1.0), h * 0.18);
+                vec4 colRight  = sampleSmoothBorder(vec2(rX, uv.y), vec2(0.0, 1.0), h * 0.18);
+                vec4 colBottom = sampleSmoothBorder(vec2(uv.x, bY), vec2(1.0, 0.0), w * 0.18);
+                vec4 colTop    = sampleSmoothBorder(vec2(uv.x, tY), vec2(1.0, 0.0), w * 0.18);
+                vec4 colDiagTL = texture2D(uTexSampler, vec2(lX, tY));
+
+                // Inverse distance weights
+                float wL = 1.0 / pow(max(0.03, u), 1.35);
+                float wR = 1.0 / pow(max(0.03, 1.0 - u), 1.35);
+                float wB = 1.0 / pow(max(0.03, v), 1.35);
+                float wT = 1.0 / pow(max(0.03, 1.0 - v), 1.35);
+
+                // If the box is at the edge/corner of the screen (e.g. Gemini bottom-right),
+                // disable sampling from the screen edge so only clean interior video is used!
+                if (uLeft < 0.03)   wL *= 0.02;
+                if (uRight > 0.97)  wR *= 0.02;
+                if (uBottom < 0.03) wB *= 0.02;
+                if (uTop > 0.97)    wT *= 0.02;
+
+                float totalW = wL + wR + wB + wT + 0.35;
+                vec4 inpainted = (colLeft * wL + colRight * wR + colBottom * wB + colTop * wT + colDiagTL * 0.35) / totalW;
+
+                // Soft elliptical feather mask: fades smoothly at the edges so no box outline is visible
+                vec2 centered = vec2((u - 0.5) * 2.0, (v - 0.5) * 2.0);
+                float roundedDist = length(centered * centered * centered); // Super-ellipse shape
+                float featherMask = 1.0 - smoothstep(0.45, 1.0, roundedDist);
+
+                gl_FragColor = mix(origColor, inpainted, featherMask);
+            }
+        """
+    }
+}
+
+// 4. Video Processor Manager
 object WatermarkProcessor {
 
     fun getVideoAspectRatio(context: Context, uri: Uri): Float {
@@ -100,226 +275,90 @@ object WatermarkProcessor {
         context: Context,
         inputUri: Uri,
         normRect: NormalizedRect,
+        removalMode: Int,
         onProgress: (Int, String) -> Unit,
-        onResult: (Boolean, File?, String) -> Unit
+        onResult: (Boolean, ProcessedVideo?, String) -> Unit
     ) {
         val mainHandler = Handler(Looper.getMainLooper())
 
-        Thread {
+        val outputFile = File(
+            context.getExternalFilesDir(null),
+            "PixelFixer_${System.currentTimeMillis()}.mp4"
+        )
+        if (outputFile.exists()) outputFile.delete()
+
+        mainHandler.post {
             try {
-                mainHandler.post { onProgress(3, "Analyzing video dimensions...") }
+                onProgress(5, "Initializing GPU Shader Engine...")
 
-                val retriever = MediaMetadataRetriever()
-                retriever.setDataSource(context, inputUri)
-                val rawWidth = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 1080
-                val rawHeight = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 1920
-                val rotation = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
-                val durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 5000L
+                val delogoEffect = DelogoGlEffect(normRect, removalMode)
+                val effects = Effects(emptyList(), listOf<Effect>(delogoEffect))
+                val editedMediaItem = EditedMediaItem.Builder(MediaItem.fromUri(inputUri))
+                    .setEffects(effects)
+                    .build()
 
-                val videoWidth = if (rotation == 90 || rotation == 270) rawHeight else rawWidth
-                val videoHeight = if (rotation == 90 || rotation == 270) rawWidth else rawHeight
+                var isFinished = false
 
-                // Calculate exact watermark pixel box inside the video frame
-                val boxX = (normRect.leftPercent * videoWidth).toInt().coerceIn(2, max(4, videoWidth - 16))
-                val boxY = (normRect.topPercent * videoHeight).toInt().coerceIn(2, max(4, videoHeight - 16))
-                val boxW = (normRect.widthPercent * videoWidth).toInt().coerceIn(8, max(8, videoWidth - boxX - 2))
-                val boxH = (normRect.heightPercent * videoHeight).toInt().coerceIn(8, max(8, videoHeight - boxY - 2))
-
-                // Sample 8 keyframes across the video to build seamless Delogo Inpaint patches
-                val numSamples = 8
-                val patchFrames = ArrayList<IntArray>(numSamples)
-
-                for (i in 0 until numSamples) {
-                    val sampleTimeUs = ((durationMs * 1000L * i) / numSamples).coerceAtLeast(0L)
-                    val pct = 5 + ((i + 1) * 20 / numSamples)
-                    mainHandler.post {
-                        onProgress(pct, "Inpainting background pixels (${i + 1}/$numSamples)...")
-                    }
-
-                    val frameBmp = retriever.getFrameAtTime(sampleTimeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-                    if (frameBmp != null) {
-                        val scaledFrame = if (frameBmp.width != videoWidth || frameBmp.height != videoHeight) {
-                            Bitmap.createScaledBitmap(frameBmp, videoWidth, videoHeight, true)
-                        } else {
-                            frameBmp
-                        }
-                        patchFrames.add(createDelogoPatch(scaledFrame, boxX, boxY, boxW, boxH))
-                        if (scaledFrame !== frameBmp) scaledFrame.recycle()
-                        frameBmp.recycle()
-                    }
-                }
-                retriever.release()
-
-                if (patchFrames.isEmpty()) {
-                    val fallbackPatch = IntArray(boxW * boxH) { AndroidColor.argb(255, 24, 24, 24) }
-                    patchFrames.add(fallbackPatch)
-                }
-
-                // Create a single transparent overlay frame and write the first inpainted patch into it
-                val overlayBitmap = Bitmap.createBitmap(videoWidth, videoHeight, Bitmap.Config.ARGB_8888)
-                var currentPatchIndex = -1
-
-                val dynamicDelogoOverlay = object : BitmapOverlay() {
-                    override fun getBitmap(presentationTimeUs: Long): Bitmap {
-                        val durationUs = max(1000L, durationMs * 1000L)
-                        val idx = ((presentationTimeUs.toDouble() / durationUs.toDouble()) * patchFrames.size)
-                            .toInt()
-                            .coerceIn(0, patchFrames.size - 1)
-
-                        if (idx != currentPatchIndex) {
-                            currentPatchIndex = idx
-                            val pixels = patchFrames[idx]
-                            overlayBitmap.setPixels(pixels, 0, boxW, boxX, boxY, boxW, boxH)
-                        }
-                        return overlayBitmap
-                    }
-                }
-
-                val outputFile = File(
-                    context.getExternalFilesDir(null),
-                    "PixelFixer_${System.currentTimeMillis()}.mp4"
-                )
-                if (outputFile.exists()) outputFile.delete()
-
-                // Start Google Media3 Hardware Transformer on the Main Thread
-                mainHandler.post {
-                    onProgress(28, "Starting hardware video encoder...")
-
-                    val overlayEffect = OverlayEffect(ImmutableList.of<TextureOverlay>(dynamicDelogoOverlay))
-                    val effects = Effects(emptyList(), listOf<Effect>(overlayEffect))
-                    val editedMediaItem = EditedMediaItem.Builder(MediaItem.fromUri(inputUri))
-                        .setEffects(effects)
-                        .build()
-
-                    var isFinished = false
-
-                    val transformer = Transformer.Builder(context)
-                        .setVideoMimeType(MimeTypes.VIDEO_H264)
-                        .addListener(object : Transformer.Listener {
-                            override fun onCompleted(composition: Composition, exportResult: ExportResult) {
-                                isFinished = true
-                                overlayBitmap.recycle()
-                                Thread {
-                                    val galleryMsg = saveToPhoneGallery(context, outputFile)
-                                    mainHandler.post {
-                                        onProgress(100, "100% Complete!")
-                                        onResult(true, outputFile, galleryMsg)
-                                    }
-                                }.start()
-                            }
-
-                            override fun onError(
-                                composition: Composition,
-                                exportResult: ExportResult,
-                                exportException: ExportException
-                            ) {
-                                isFinished = true
-                                overlayBitmap.recycle()
+                val transformer = Transformer.Builder(context)
+                    .setVideoMimeType(MimeTypes.VIDEO_H264)
+                    .addListener(object : Transformer.Listener {
+                        override fun onCompleted(composition: Composition, exportResult: ExportResult) {
+                            isFinished = true
+                            Thread {
+                                val galleryUri = saveToPhoneGallery(context, outputFile)
                                 mainHandler.post {
+                                    onProgress(100, "100% Complete!")
                                     onResult(
-                                        false,
-                                        null,
-                                        "Encoder Error (${exportException.errorCodeName}): ${exportException.localizedMessage}"
+                                        true,
+                                        ProcessedVideo(outputFile, galleryUri),
+                                        "Saved to Gallery (Movies/PixelFixer)!"
                                     )
                                 }
-                            }
-                        })
-                        .build()
+                            }.start()
+                        }
 
-                    transformer.start(editedMediaItem, outputFile.absolutePath)
-
-                    // Poll live 0-100% hardware encoding progress every 200ms
-                    val progressHolder = ProgressHolder()
-                    val progressRunnable = object : Runnable {
-                        override fun run() {
-                            if (isFinished) return
-                            val state = transformer.getProgress(progressHolder)
-                            if (state == Transformer.PROGRESS_STATE_AVAILABLE) {
-                                val mappedPct = (28 + (progressHolder.progress * 71 / 100)).coerceIn(28, 99)
-                                onProgress(mappedPct, "Removing watermark... $mappedPct%")
-                            }
-                            if (state != Transformer.PROGRESS_STATE_NOT_STARTED && !isFinished) {
-                                mainHandler.postDelayed(this, 200L)
+                        override fun onError(
+                            composition: Composition,
+                            exportResult: ExportResult,
+                            exportException: ExportException
+                        ) {
+                            isFinished = true
+                            mainHandler.post {
+                                onResult(
+                                    false,
+                                    null,
+                                    "Encoder Error (${exportException.errorCodeName}): ${exportException.localizedMessage}"
+                                )
                             }
                         }
+                    })
+                    .build()
+
+                transformer.start(editedMediaItem, outputFile.absolutePath)
+
+                val progressHolder = ProgressHolder()
+                val progressRunnable = object : Runnable {
+                    override fun run() {
+                        if (isFinished) return
+                        val state = transformer.getProgress(progressHolder)
+                        if (state == Transformer.PROGRESS_STATE_AVAILABLE) {
+                            val pct = (5 + (progressHolder.progress * 94 / 100)).coerceIn(5, 99)
+                            onProgress(pct, "Removing watermark... $pct%")
+                        }
+                        if (state != Transformer.PROGRESS_STATE_NOT_STARTED && !isFinished) {
+                            mainHandler.postDelayed(this, 150L)
+                        }
                     }
-                    mainHandler.postDelayed(progressRunnable, 200L)
                 }
+                mainHandler.postDelayed(progressRunnable, 150L)
 
             } catch (e: Throwable) {
-                mainHandler.post {
-                    onResult(false, null, "Error (${e.javaClass.simpleName}): ${e.localizedMessage ?: "Unknown error"}")
-                }
-            }
-        }.start()
-    }
-
-    /**
-     * True 2D Bilinear Delogo Interpolation:
-     * Samples the clean border pixels surrounding the watermark box (top, bottom, left, right)
-     * and smoothly interpolates them across the box so the watermark disappears seamlessly.
-     */
-    private fun createDelogoPatch(frame: Bitmap, boxX: Int, boxY: Int, boxW: Int, boxH: Int): IntArray {
-        val patch = IntArray(boxW * boxH)
-        val imgW = frame.width
-        val imgH = frame.height
-
-        val leftX = (boxX - 2).coerceIn(0, imgW - 1)
-        val rightX = (boxX + boxW + 1).coerceIn(0, imgW - 1)
-        val topY = (boxY - 2).coerceIn(0, imgH - 1)
-        val bottomY = (boxY + boxH + 1).coerceIn(0, imgH - 1)
-
-        val topRow = IntArray(boxW) { dx -> frame.getPixel((boxX + dx).coerceIn(0, imgW - 1), topY) }
-        val bottomRow = IntArray(boxW) { dx -> frame.getPixel((boxX + dx).coerceIn(0, imgW - 1), bottomY) }
-        val leftCol = IntArray(boxH) { dy -> frame.getPixel(leftX, (boxY + dy).coerceIn(0, imgH - 1)) }
-        val rightCol = IntArray(boxH) { dy -> frame.getPixel(rightX, (boxY + dy).coerceIn(0, imgH - 1)) }
-
-        for (dy in 0 until boxH) {
-            val v = (dy + 1).toFloat() / (boxH + 1).toFloat()
-            val distV = min(v, 1f - v)
-            val leftPx = leftCol[dy]
-            val rightPx = rightCol[dy]
-
-            for (dx in 0 until boxW) {
-                val u = (dx + 1).toFloat() / (boxW + 1).toFloat()
-                val distU = min(u, 1f - u)
-
-                val topPx = topRow[dx]
-                val bottomPx = bottomRow[dx]
-
-                // Inverse-distance weights to the 4 clean edges
-                val wLeft = 1f / max(0.02f, u)
-                val wRight = 1f / max(0.02f, 1f - u)
-                val wTop = 1f / max(0.02f, v)
-                val wBottom = 1f / max(0.02f, 1f - v)
-                val totalW = wLeft + wRight + wTop + wBottom
-
-                val r = ((AndroidColor.red(leftPx) * wLeft +
-                        AndroidColor.red(rightPx) * wRight +
-                        AndroidColor.red(topPx) * wTop +
-                        AndroidColor.red(bottomPx) * wBottom) / totalW).toInt().coerceIn(0, 255)
-
-                val g = ((AndroidColor.green(leftPx) * wLeft +
-                        AndroidColor.green(rightPx) * wRight +
-                        AndroidColor.green(topPx) * wTop +
-                        AndroidColor.green(bottomPx) * wBottom) / totalW).toInt().coerceIn(0, 255)
-
-                val b = ((AndroidColor.blue(leftPx) * wLeft +
-                        AndroidColor.blue(rightPx) * wRight +
-                        AndroidColor.blue(topPx) * wTop +
-                        AndroidColor.blue(bottomPx) * wBottom) / totalW).toInt().coerceIn(0, 255)
-
-                // Smoothly feather the outer 6% edge so there is no hard rectangle line
-                val edgeFactor = (min(distU, distV) / 0.06f).coerceIn(0.25f, 1f)
-                val alpha = (edgeFactor * 255f).toInt().coerceIn(0, 255)
-
-                patch[dy * boxW + dx] = AndroidColor.argb(alpha, r, g, b)
+                onResult(false, null, "Error: ${e.localizedMessage ?: "Failed to process"}")
             }
         }
-        return patch
     }
 
-    private fun saveToPhoneGallery(context: Context, videoFile: File): String {
+    fun saveToPhoneGallery(context: Context, videoFile: File): Uri? {
         return try {
             val values = ContentValues().apply {
                 put(MediaStore.Video.Media.DISPLAY_NAME, videoFile.name)
@@ -343,17 +382,50 @@ object WatermarkProcessor {
                     values.put(MediaStore.Video.Media.IS_PENDING, 0)
                     resolver.update(itemUri, values, null, null)
                 }
-                "Saved to Gallery (Movies/PixelFixer)!"
-            } else {
-                "Saved in App Studio!"
+            }
+            itemUri
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    fun shareVideo(context: Context, video: ProcessedVideo, targetPackage: String?) {
+        try {
+            val contentUri = video.shareUri ?: saveToPhoneGallery(context, video.file)
+            if (contentUri == null) {
+                Toast.makeText(context, "Could not prepare video for sharing", Toast.LENGTH_SHORT).show()
+                return
+            }
+
+            val intent = Intent(Intent.ACTION_SEND).apply {
+                type = "video/mp4"
+                putExtra(Intent.EXTRA_STREAM, contentUri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                if (targetPackage != null) {
+                    setPackage(targetPackage)
+                }
+            }
+
+            try {
+                context.startActivity(
+                    if (targetPackage != null) intent else Intent.createChooser(intent, "Share Cleaned Video")
+                )
+            } catch (e: Exception) {
+                // If WhatsApp or Instagram isn't installed, fall back to the universal system share sheet
+                val fallbackIntent = Intent(Intent.ACTION_SEND).apply {
+                    type = "video/mp4"
+                    putExtra(Intent.EXTRA_STREAM, contentUri)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                context.startActivity(Intent.createChooser(fallbackIntent, "Share Cleaned Video"))
             }
         } catch (e: Exception) {
-            "Saved in App Studio: ${videoFile.name}"
+            Toast.makeText(context, "Share error: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
         }
     }
 }
 
-// 3. Main Activity
+// 5. Main Activity
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -365,12 +437,12 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-// 4. App Navigation
+// 6. Main App Navigation
 @Composable
 fun WatermarkRemoverApp() {
     var currentTab by remember { mutableIntStateOf(0) }
     var selectedVideoUri by remember { mutableStateOf<Uri?>(null) }
-    val processedVideos = remember { mutableStateListOf<File>() }
+    val processedVideos = remember { mutableStateListOf<ProcessedVideo>() }
     var showPaywall by remember { mutableStateOf(false) }
 
     val videoPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
@@ -428,8 +500,8 @@ fun WatermarkRemoverApp() {
                         VideoEditorScreen(
                             videoUri = selectedVideoUri!!,
                             onChangeVideo = { videoPicker.launch("video/*") },
-                            onSuccess = { file ->
-                                processedVideos.add(0, file)
+                            onSuccess = { processedVideo ->
+                                processedVideos.add(0, processedVideo)
                                 currentTab = 1
                             }
                         )
@@ -470,7 +542,7 @@ fun HomeDashboard(onPickVideo: () -> Unit) {
         )
         Spacer(Modifier.height(8.dp))
         Text(
-            "Powered by Google Media3 Hardware Engine. Select any video to erase its corner watermark.",
+            "Real-Time GPU Watermark Eraser. Removes corner watermarks smoothly without adding boxes.",
             color = Color.Gray,
             textAlign = TextAlign.Center
         )
@@ -491,21 +563,24 @@ fun HomeDashboard(onPickVideo: () -> Unit) {
 fun VideoEditorScreen(
     videoUri: Uri,
     onChangeVideo: () -> Unit,
-    onSuccess: (File) -> Unit
+    onSuccess: (ProcessedVideo) -> Unit
 ) {
     val context = LocalContext.current
     var containerSize by remember { mutableStateOf(IntSize.Zero) }
     val videoAspectRatio = remember(videoUri) { WatermarkProcessor.getVideoAspectRatio(context, videoUri) }
 
-    // Default to Bottom-Right Corner (Standard Google Gemini Watermark Position)
-    var boxLeft by remember { mutableFloatStateOf(0.72f) }
-    var boxTop by remember { mutableFloatStateOf(0.86f) }
-    var boxWidth by remember { mutableFloatStateOf(0.26f) }
-    var boxHeight by remember { mutableFloatStateOf(0.12f) }
+    // Tighter default fit for the Google Gemini bottom-right sparkle/logo
+    var boxLeft by remember { mutableFloatStateOf(0.78f) }
+    var boxTop by remember { mutableFloatStateOf(0.88f) }
+    var boxWidth by remember { mutableFloatStateOf(0.20f) }
+    var boxHeight by remember { mutableFloatStateOf(0.10f) }
+
+    // 0 = Seamless GPU Erase (Feathered), 1 = Smart Corner Zoom (100% Zero Blur)
+    var removalMode by remember { mutableIntStateOf(0) }
 
     var isProcessing by remember { mutableStateOf(false) }
     var progressPercent by remember { mutableIntStateOf(0) }
-    var statusMessage by remember { mutableStateOf("Red box is set to Gemini Corner. Drag to adjust!") }
+    var statusMessage by remember { mutableStateOf("Place the rounded target tightly over the Gemini logo.") }
     var errorDialogMessage by remember { mutableStateOf<String?>(null) }
 
     val exoPlayer = remember(videoUri) {
@@ -584,6 +659,7 @@ fun VideoEditorScreen(
                     modifier = Modifier.fillMaxSize()
                 )
 
+                // Rounded Target Overlay (shows exact feathered erase zone)
                 Canvas(
                     modifier = Modifier
                         .fillMaxSize()
@@ -592,9 +668,9 @@ fun VideoEditorScreen(
                                 change.consume()
                                 if (containerSize.width > 0 && containerSize.height > 0) {
                                     boxLeft = (boxLeft + dragAmount.x / containerSize.width)
-                                        .coerceIn(0.01f, max(0.01f, 0.99f - boxWidth))
+                                        .coerceIn(0.005f, max(0.005f, 0.995f - boxWidth))
                                     boxTop = (boxTop + dragAmount.y / containerSize.height)
-                                        .coerceIn(0.01f, max(0.01f, 0.99f - boxHeight))
+                                        .coerceIn(0.005f, max(0.005f, 0.995f - boxHeight))
                                 }
                             }
                         }
@@ -604,34 +680,62 @@ fun VideoEditorScreen(
                     val rectW = boxWidth * size.width
                     val rectH = boxHeight * size.height
 
-                    drawRect(
-                        color = Color.Red.copy(alpha = 0.30f),
-                        topLeft = Offset(rectLeft, rectTop),
-                        size = Size(rectW, rectH)
-                    )
-                    drawRect(
-                        color = Color.Red,
+                    drawRoundRect(
+                        color = Color(0xFF00E5FF).copy(alpha = 0.22f),
                         topLeft = Offset(rectLeft, rectTop),
                         size = Size(rectW, rectH),
-                        style = Stroke(width = 6f)
+                        cornerRadius = CornerRadius(rectW * 0.35f, rectH * 0.35f)
+                    )
+                    drawRoundRect(
+                        color = Color(0xFF00E5FF),
+                        topLeft = Offset(rectLeft, rectTop),
+                        size = Size(rectW, rectH),
+                        cornerRadius = CornerRadius(rectW * 0.35f, rectH * 0.35f),
+                        style = Stroke(width = 5f)
                     )
                 }
             }
         }
 
-        Spacer(Modifier.height(10.dp))
+        Spacer(Modifier.height(8.dp))
 
+        // Removal Mode Selector
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            FilterChip(
+                selected = removalMode == 0,
+                onClick = {
+                    removalMode = 0
+                    statusMessage = "Seamless Erase: Smoothly blends live pixels over the watermark."
+                },
+                label = { Text("✨ Seamless Erase", fontSize = 12.sp) },
+                modifier = Modifier.weight(1f)
+            )
+            FilterChip(
+                selected = removalMode == 1,
+                onClick = {
+                    removalMode = 1
+                    statusMessage = "Smart Edge Zoom: Pushes corner watermark out with 100% sharp pixels."
+                },
+                label = { Text("🔍 Smart Edge Zoom", fontSize = 12.sp) },
+                modifier = Modifier.weight(1f)
+            )
+        }
+
+        // Quick Corner Presets
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             FilledTonalButton(
                 onClick = {
-                    boxWidth = 0.26f
-                    boxHeight = 0.12f
-                    boxLeft = 0.72f
-                    boxTop = 0.86f
-                    statusMessage = "Snapped to Bottom-Right Gemini Watermark!"
+                    boxWidth = 0.20f
+                    boxHeight = 0.10f
+                    boxLeft = 0.78f
+                    boxTop = 0.88f
+                    statusMessage = "Snapped tightly to Bottom-Right Gemini Corner!"
                 },
                 modifier = Modifier.weight(1f)
             ) {
@@ -639,10 +743,10 @@ fun VideoEditorScreen(
             }
             FilledTonalButton(
                 onClick = {
-                    boxWidth = 0.26f
-                    boxHeight = 0.12f
-                    boxLeft = 0.72f
-                    boxTop = 0.03f
+                    boxWidth = 0.20f
+                    boxHeight = 0.10f
+                    boxLeft = 0.78f
+                    boxTop = 0.02f
                     statusMessage = "Snapped to Top-Right Corner!"
                 },
                 modifier = Modifier.weight(1f)
@@ -651,22 +755,22 @@ fun VideoEditorScreen(
             }
         }
 
-        Spacer(Modifier.height(6.dp))
-        Text("Box Width & Height:", fontSize = 12.sp, color = Color.Gray)
+        Spacer(Modifier.height(4.dp))
+        Text("Adjust Target Width & Height:", fontSize = 12.sp, color = Color.Gray)
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             Slider(
                 value = boxWidth,
                 onValueChange = {
-                    boxWidth = it.coerceIn(0.05f, 0.95f)
-                    if (boxLeft + boxWidth > 0.99f) boxLeft = (0.99f - boxWidth).coerceAtLeast(0.01f)
+                    boxWidth = it.coerceIn(0.04f, 0.60f)
+                    if (boxLeft + boxWidth > 0.995f) boxLeft = (0.995f - boxWidth).coerceAtLeast(0.005f)
                 },
                 modifier = Modifier.weight(1f)
             )
             Slider(
                 value = boxHeight,
                 onValueChange = {
-                    boxHeight = it.coerceIn(0.05f, 0.95f)
-                    if (boxTop + boxHeight > 0.99f) boxTop = (0.99f - boxHeight).coerceAtLeast(0.01f)
+                    boxHeight = it.coerceIn(0.04f, 0.40f)
+                    if (boxTop + boxHeight > 0.995f) boxTop = (0.995f - boxHeight).coerceAtLeast(0.005f)
                 },
                 modifier = Modifier.weight(1f)
             )
@@ -685,21 +789,22 @@ fun VideoEditorScreen(
                     exoPlayer.pause()
                     isProcessing = true
                     progressPercent = 1
-                    statusMessage = "Starting Media3 Engine..."
+                    statusMessage = "Starting GPU Watermark Eraser..."
 
                     WatermarkProcessor.removeWatermark(
                         context = context,
                         inputUri = videoUri,
                         normRect = NormalizedRect(boxLeft, boxTop, boxWidth, boxHeight),
+                        removalMode = removalMode,
                         onProgress = { pct, msg ->
                             progressPercent = pct
                             statusMessage = msg
                         },
-                        onResult = { success, file, msg ->
+                        onResult = { success, processedVideo, msg ->
                             isProcessing = false
                             statusMessage = msg
-                            if (success && file != null) {
-                                onSuccess(file)
+                            if (success && processedVideo != null) {
+                                onSuccess(processedVideo)
                             } else {
                                 errorDialogMessage = msg
                             }
@@ -714,20 +819,20 @@ fun VideoEditorScreen(
     }
 }
 
-// 5. My Studio Screen with Video Preview + "Save to Any Folder" Picker
+// 7. My Studio Screen with Video Player + WhatsApp, Instagram & Save Folder Buttons
 @Composable
-fun StudioGalleryScreen(files: List<File>) {
+fun StudioGalleryScreen(videos: List<ProcessedVideo>) {
     val context = LocalContext.current
-    var selectedFile by remember { mutableStateOf(files.firstOrNull()) }
+    var selectedVideo by remember { mutableStateOf(videos.firstOrNull()) }
     var saveStatusText by remember { mutableStateOf("✅ Auto-saved to Gallery (Movies/PixelFixer)") }
 
     val saveToCustomFolderLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("video/mp4")
     ) { destinationUri: Uri? ->
-        if (destinationUri != null && selectedFile != null) {
+        if (destinationUri != null && selectedVideo != null) {
             try {
                 context.contentResolver.openOutputStream(destinationUri)?.use { outStream ->
-                    FileInputStream(selectedFile!!).use { inStream ->
+                    FileInputStream(selectedVideo!!.file).use { inStream ->
                         inStream.copyTo(outStream)
                     }
                 }
@@ -739,9 +844,9 @@ fun StudioGalleryScreen(files: List<File>) {
         }
     }
 
-    LaunchedEffect(files.size) {
-        if (files.isNotEmpty()) {
-            selectedFile = files.first()
+    LaunchedEffect(videos.size) {
+        if (videos.isNotEmpty()) {
+            selectedVideo = videos.first()
         }
     }
 
@@ -754,7 +859,7 @@ fun StudioGalleryScreen(files: List<File>) {
         Text("My Studio (Cleaned Videos)", fontSize = 20.sp, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(8.dp))
 
-        if (files.isEmpty()) {
+        if (videos.isEmpty()) {
             Text(
                 "No videos cleaned yet. Go to the Editor tab, select a Gemini video, and tap Remove Watermark!",
                 color = Color.Gray
@@ -768,10 +873,10 @@ fun StudioGalleryScreen(files: List<File>) {
             )
             Spacer(Modifier.height(12.dp))
 
-            selectedFile?.let { file ->
-                val previewPlayer = remember(file.absolutePath) {
+            selectedVideo?.let { video ->
+                val previewPlayer = remember(video.file.absolutePath) {
                     ExoPlayer.Builder(context).build().apply {
-                        setMediaItem(MediaItem.fromUri(Uri.fromFile(file)))
+                        setMediaItem(MediaItem.fromUri(Uri.fromFile(video.file)))
                         repeatMode = ExoPlayer.REPEAT_MODE_ALL
                         prepare()
                         playWhenReady = true
@@ -804,15 +909,64 @@ fun StudioGalleryScreen(files: List<File>) {
 
                         Spacer(Modifier.height(12.dp))
 
-                        Button(
-                            onClick = {
-                                saveToCustomFolderLauncher.launch(file.name)
-                            },
-                            modifier = Modifier.fillMaxWidth()
+                        // 1-Tap WhatsApp & Instagram Share Buttons
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            Icon(Icons.Default.FolderOpen, contentDescription = null)
-                            Spacer(Modifier.width(8.dp))
-                            Text("Save Video to Any Folder...")
+                            Button(
+                                onClick = {
+                                    WatermarkProcessor.shareVideo(context, video, "com.whatsapp")
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF25D366)),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Icon(Icons.Default.Send, contentDescription = null, tint = Color.White)
+                                Spacer(Modifier.width(6.dp))
+                                Text("WhatsApp", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                            }
+
+                            Button(
+                                onClick = {
+                                    WatermarkProcessor.shareVideo(context, video, "com.instagram.android")
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE1306C)),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Icon(Icons.Default.Share, contentDescription = null, tint = Color.White)
+                                Spacer(Modifier.width(6.dp))
+                                Text("Instagram", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                            }
+                        }
+
+                        Spacer(Modifier.height(8.dp))
+
+                        // Save to Any Folder + General Share Row
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            OutlinedButton(
+                                onClick = {
+                                    saveToCustomFolderLauncher.launch(video.file.name)
+                                },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Icon(Icons.Default.FolderOpen, contentDescription = null)
+                                Spacer(Modifier.width(6.dp))
+                                Text("Save Folder", fontSize = 12.sp)
+                            }
+
+                            OutlinedButton(
+                                onClick = {
+                                    WatermarkProcessor.shareVideo(context, video, null)
+                                },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Icon(Icons.Default.MoreHoriz, contentDescription = null)
+                                Spacer(Modifier.width(6.dp))
+                                Text("More Apps", fontSize = 12.sp)
+                            }
                         }
                     }
                 }
@@ -820,14 +974,14 @@ fun StudioGalleryScreen(files: List<File>) {
 
             Spacer(Modifier.height(16.dp))
             Text("Processed History:", fontWeight = FontWeight.Bold)
-            files.forEach { file ->
+            videos.forEach { video ->
                 Card(
-                    onClick = { selectedFile = file },
+                    onClick = { selectedVideo = video },
                     modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
                 ) {
                     Column(modifier = Modifier.padding(12.dp)) {
-                        Text(file.name, fontWeight = FontWeight.Bold)
-                        Text("Tap to preview or save", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
+                        Text(video.file.name, fontWeight = FontWeight.Bold)
+                        Text("Tap to preview or share", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
                     }
                 }
             }
