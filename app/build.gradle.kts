@@ -4,7 +4,7 @@ plugins {
 }
 
 android {
-    namespace = "com.saas.watermarkremover"
+    namespace = "com.saas.pixelfixer"
     compileSdk = 34
 
     defaultConfig {
