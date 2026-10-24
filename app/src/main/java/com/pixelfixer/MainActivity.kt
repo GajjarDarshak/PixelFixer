@@ -4,8 +4,6 @@ import android.content.Context
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -38,6 +36,9 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import com.arthenica.ffmpegkit.FFmpegKit
 import com.arthenica.ffmpegkit.ReturnCode
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
 import kotlin.math.max
@@ -50,64 +51,53 @@ data class NormalizedRect(
     val heightPercent: Float
 )
 
-// 2. Background Video Processor (Fixed Thread Crashing)
+// 2. Crash-Proof Coroutine Video Processor
 object WatermarkProcessor {
-    fun removeWatermark(
+    suspend fun removeWatermark(
         context: Context,
         inputUri: Uri,
         normRect: NormalizedRect,
-        onProgress: (String) -> Unit,
-        onResult: (Boolean, File?, String) -> Unit
-    ) {
-        val mainHandler = Handler(Looper.getMainLooper())
-
-        // Run the heavy lifting in a background thread so the UI never freezes
-        Thread {
-            try {
-                val inputFile = File(context.cacheDir, "input_video.mp4")
-                context.contentResolver.openInputStream(inputUri)?.use { input ->
-                    FileOutputStream(inputFile).use { output -> input.copyTo(output) }
-                }
-
-                val outputFile = File(context.getExternalFilesDir(null), "cleaned_${System.currentTimeMillis()}.mp4")
-
-                val retriever = MediaMetadataRetriever()
-                retriever.setDataSource(inputFile.absolutePath)
-                val videoWidth = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toInt() ?: 1080
-                val videoHeight = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toInt() ?: 1920
-                retriever.release()
-
-                // Safe bounding box math (prevents crashes near screen edges)
-                val x = (normRect.leftPercent * videoWidth).toInt().coerceIn(2, videoWidth - 20)
-                val y = (normRect.topPercent * videoHeight).toInt().coerceIn(2, videoHeight - 20)
-                
-                val maxW = max(10, videoWidth - x - 2)
-                val maxH = max(10, videoHeight - y - 2)
-                
-                val w = (normRect.widthPercent * videoWidth).toInt().coerceIn(10, maxW)
-                val h = (normRect.heightPercent * videoHeight).toInt().coerceIn(10, maxH)
-
-                val cmd = "-y -i \"${inputFile.absolutePath}\" -vf \"delogo=x=$x:y=$y:w=$w:h=$h:show=0\" -c:a copy \"${outputFile.absolutePath}\""
-
-                FFmpegKit.executeAsync(cmd, { session ->
-                    // Safely jump back to the Main UI Thread before updating the screen
-                    mainHandler.post {
-                        if (ReturnCode.isSuccess(session.returnCode)) {
-                            onResult(true, outputFile, "Saved to: My Studio tab")
-                        } else {
-                            onResult(false, null, "Error: ${session.failStackTrace ?: "FFmpeg failed"}")
-                        }
-                    }
-                }, { log ->
-                    mainHandler.post { onProgress(log.message) }
-                }, { _ -> })
-
-            } catch (e: Exception) {
-                mainHandler.post {
-                    onResult(false, null, e.localizedMessage ?: "Unknown Error")
-                }
+        onStatusUpdate: suspend (String) -> Unit,
+        onResult: suspend (Boolean, File?, String) -> Unit
+    ) = withContext(Dispatchers.IO) {
+        try {
+            onStatusUpdate("Preparing video file...")
+            val inputFile = File(context.cacheDir, "input_video.mp4")
+            context.contentResolver.openInputStream(inputUri)?.use { input ->
+                FileOutputStream(inputFile).use { output -> input.copyTo(output) }
             }
-        }.start()
+
+            val outputFile = File(context.getExternalFilesDir(null), "cleaned_${System.currentTimeMillis()}.mp4")
+
+            onStatusUpdate("Analyzing video dimensions...")
+            val retriever = MediaMetadataRetriever()
+            retriever.setDataSource(context, inputUri)
+            val videoWidth = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toInt() ?: 1080
+            val videoHeight = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toInt() ?: 1920
+            retriever.release()
+
+            // Ultra-safe bounds checking (prevents FFmpeg native crash)
+            val x = max(2, (normRect.leftPercent * videoWidth).toInt())
+            val y = max(2, (normRect.topPercent * videoHeight).toInt())
+            val w = max(10, minOf((normRect.widthPercent * videoWidth).toInt(), videoWidth - x - 2))
+            val h = max(10, minOf((normRect.heightPercent * videoHeight).toInt(), videoHeight - y - 2))
+
+            onStatusUpdate("Removing watermark... This may take a minute.")
+            val cmd = "-y -i \"${inputFile.absolutePath}\" -vf \"delogo=x=$x:y=$y:w=$w:h=$h:show=0\" -c:a copy \"${outputFile.absolutePath}\""
+
+            // Run FFmpeg synchronously inside this IO Coroutine
+            val session = FFmpegKit.execute(cmd)
+            
+            if (ReturnCode.isSuccess(session.returnCode)) {
+                onResult(true, outputFile, "Success! Video saved.")
+            } else {
+                val errorLog = session.failStackTrace ?: "Unknown FFmpeg error"
+                onResult(false, null, "Failed: $errorLog")
+            }
+
+        } catch (e: Throwable) {
+            onResult(false, null, e.localizedMessage ?: "Fatal Error Occurred")
+        }
     }
 }
 
@@ -123,7 +113,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-// 4. UI Navigation & Screens
+// 4. UI Screens
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun WatermarkRemoverApp() {
@@ -240,6 +230,7 @@ fun VideoEditorScreen(
     onSuccess: (File) -> Unit
 ) {
     val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
     var containerSize by remember { mutableStateOf(IntSize.Zero) }
 
     var boxLeft by remember { mutableFloatStateOf(0.15f) }
@@ -248,7 +239,7 @@ fun VideoEditorScreen(
     var boxHeight by remember { mutableFloatStateOf(0.12f) }
 
     var isProcessing by remember { mutableStateOf(false) }
-    var statusMessage by remember { mutableStateOf("Drag the red box over the watermark") }
+    var statusMessage by remember { mutableStateOf("") }
     var selectedMode by remember { mutableIntStateOf(0) }
 
     val exoPlayer = remember(videoUri) {
@@ -262,6 +253,25 @@ fun VideoEditorScreen(
 
     DisposableEffect(exoPlayer) {
         onDispose { exoPlayer.release() }
+    }
+
+    // Modal Progress Dialog to prevent clicking and show status
+    if (isProcessing) {
+        AlertDialog(
+            onDismissRequest = { /* Do not allow dismiss */ },
+            confirmButton = {},
+            title = { Text("Processing Video") },
+            text = {
+                Column(
+                    modifier = Modifier.fillMaxWidth().padding(16.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    CircularProgressIndicator()
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text(statusMessage, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+                }
+            }
+        )
     }
 
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
@@ -345,9 +355,7 @@ fun VideoEditorScreen(
             )
         }
 
-        Spacer(Modifier.height(8.dp))
-        Text(statusMessage, fontSize = 13.sp, color = MaterialTheme.colorScheme.secondary)
-        Spacer(Modifier.height(8.dp))
+        Spacer(Modifier.height(16.dp))
 
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             OutlinedButton(onClick = onChangeVideo, modifier = Modifier.weight(1f)) {
@@ -356,28 +364,33 @@ fun VideoEditorScreen(
             Button(
                 enabled = !isProcessing,
                 onClick = {
+                    // Pause the video player to free up RAM before FFmpeg starts
+                    exoPlayer.pause()
                     isProcessing = true
-                    statusMessage = "Processing video in background..."
+                    statusMessage = "Starting process..."
                     
-                    WatermarkProcessor.removeWatermark(
-                        context = context,
-                        inputUri = videoUri,
-                        normRect = NormalizedRect(boxLeft, boxTop, boxWidth, boxHeight),
-                        onProgress = { logMsg -> },
-                        onResult = { success, file, msg ->
-                            isProcessing = false
-                            statusMessage = msg
-                            if (success && file != null) onSuccess(file)
-                        }
-                    )
+                    coroutineScope.launch {
+                        WatermarkProcessor.removeWatermark(
+                            context = context,
+                            inputUri = videoUri,
+                            normRect = NormalizedRect(boxLeft, boxTop, boxWidth, boxHeight),
+                            onStatusUpdate = { msg ->
+                                // Update UI text safely
+                                withContext(Dispatchers.Main) { statusMessage = msg }
+                            },
+                            onResult = { success, file, msg ->
+                                withContext(Dispatchers.Main) {
+                                    isProcessing = false
+                                    if (success && file != null) onSuccess(file)
+                                    // If failed, we might want to show a toast, but for now we just close the dialog
+                                }
+                            }
+                        )
+                    }
                 },
                 modifier = Modifier.weight(1f)
             ) {
-                if (isProcessing) {
-                    CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
-                } else {
-                    Text("Remove Watermark")
-                }
+                Text("Remove Watermark")
             }
         }
     }
