@@ -1,4 +1,4 @@
-package com.pixerfixer
+package com.pixelfixer
 
 import android.net.Uri
 import android.os.Bundle
@@ -63,7 +63,7 @@ fun WatermarkRemoverApp() {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("ClearMark Studio", fontWeight = FontWeight.Bold) },
+                title = { Text("PixelFixer", fontWeight = FontWeight.Bold) },
                 actions = {
                     Button(
                         onClick = { showPaywall = true },
@@ -86,13 +86,13 @@ fun WatermarkRemoverApp() {
                 )
                 NavigationBarItem(
                     selected = currentTab == 1,
-                    onClick = { currentTab = 1 },
+                    onClick = { currentTab == 1 },
                     icon = { Icon(Icons.Default.VideoLibrary, null) },
                     label = { Text("My Studio (${processedVideos.size})") }
                 )
                 NavigationBarItem(
                     selected = currentTab == 2,
-                    onClick = { currentTab = 2 },
+                    onClick = { currentTab == 2 },
                     icon = { Icon(Icons.Default.WorkspacePremium, null) },
                     label = { Text("Monetize / Pro") }
                 )
@@ -138,8 +138,8 @@ fun HomeDashboard(onPickVideo: () -> Unit) {
     ) {
         Icon(Icons.Default.MovieFilter, contentDescription = null, modifier = Modifier.size(80.dp), tint = MaterialTheme.colorScheme.primary)
         Spacer(Modifier.height(16.dp))
-        Text("Remove Video Watermarks", fontSize = 24.sp, fontWeight = FontWeight.Bold)
-        Text("Drag a box over any logo or text overlay to erase it instantly.", color = Color.Gray)
+        Text("PixelFixer Studio", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+        Text("Erase watermarks & logos instantly.", color = Color.Gray)
         Spacer(Modifier.height(32.dp))
         Button(
             onClick = onPickVideo,
@@ -163,7 +163,6 @@ fun VideoEditorScreen(
     val context = LocalContext.current
     var containerSize by remember { mutableStateOf(IntSize.Zero) }
 
-    // Draggable box state (normalized 0..1)
     var boxLeft by remember { mutableFloatStateOf(0.15f) }
     var boxTop by remember { mutableFloatStateOf(0.15f) }
     var boxWidth by remember { mutableFloatStateOf(0.35f) }
@@ -171,7 +170,7 @@ fun VideoEditorScreen(
 
     var isProcessing by remember { mutableStateOf(false) }
     var statusMessage by remember { mutableStateOf("Drag the red box over the watermark") }
-    var selectedMode by remember { mutableIntStateOf(0) } // 0 = Standard Free, 1 = AI Pro
+    var selectedMode by remember { mutableIntStateOf(0) }
 
     val exoPlayer = remember(videoUri) {
         ExoPlayer.Builder(context).build().apply {
@@ -187,7 +186,6 @@ fun VideoEditorScreen(
     }
 
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        // Video + Interactive Selection Box Overlay
         Box(
             modifier = Modifier
                 .weight(1f)
@@ -205,7 +203,6 @@ fun VideoEditorScreen(
                 modifier = Modifier.fillMaxSize()
             )
 
-            // Interactive Watermark Bounding Box
             Canvas(
                 modifier = Modifier
                     .fillMaxSize()
@@ -239,8 +236,6 @@ fun VideoEditorScreen(
         }
 
         Spacer(Modifier.height(12.dp))
-
-        // Box Size Sliders
         Text("Adjust Selection Box Size", fontSize = 12.sp, color = Color.Gray)
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             Slider(
@@ -255,7 +250,6 @@ fun VideoEditorScreen(
             )
         }
 
-        // Mode Selector (Free vs Paid SaaS upsell)
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             FilterChip(
                 selected = selectedMode == 0,
@@ -332,14 +326,14 @@ fun StudioGalleryScreen(files: List<File>) {
 @Composable
 fun ProPlanScreen() {
     Column(modifier = Modifier.fillMaxWidth().padding(24.dp)) {
-        Text("Unlock ClearMark PRO ✨", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+        Text("Unlock PixelFixer PRO ✨", fontSize = 24.sp, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(12.dp))
-        Text("• Cloud AI Generative Inpainting (Zero blur on moving backgrounds)")
+        Text("• Cloud AI Generative Inpainting")
         Text("• Batch Process up to 20 Reels/Shorts at once")
         Text("• 4K 60fps Original Quality Export")
         Text("• 100% Ad-Free Experience")
         Spacer(Modifier.height(20.dp))
-        Button(onClick = { /* Integrate Razorpay / Google Play Billing */ }, modifier = Modifier.fillMaxWidth()) {
+        Button(onClick = { }, modifier = Modifier.fillMaxWidth()) {
             Text("Start 3-Day Free Trial (Then ₹299/month)")
         }
     }
