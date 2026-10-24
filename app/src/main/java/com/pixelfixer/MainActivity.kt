@@ -1,9 +1,15 @@
 package com.pixelfixer
 
+import android.content.ContentValues
 import android.content.Context
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.os.Handler
+import android.os.Looper
+import android.provider.MediaStore
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -12,7 +18,9 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -27,6 +35,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -36,12 +45,11 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import com.arthenica.ffmpegkit.FFmpegKit
 import com.arthenica.ffmpegkit.ReturnCode
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import kotlin.math.max
+import kotlin.math.min
 
 // 1. Data Model
 data class NormalizedRect(
@@ -51,57 +59,142 @@ data class NormalizedRect(
     val heightPercent: Float
 )
 
-// 2. Crash-Proof Coroutine Video Processor
+// 2. Video Processor with Live 0% - 100% Progress & Gallery Export
 object WatermarkProcessor {
-    suspend fun removeWatermark(
+
+    fun getVideoAspectRatio(context: Context, uri: Uri): Float {
+        return try {
+            val retriever = MediaMetadataRetriever()
+            retriever.setDataSource(context, uri)
+            val rawW = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toFloatOrNull() ?: 1080f
+            val rawH = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toFloatOrNull() ?: 1920f
+            val rot = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
+            retriever.release()
+            val w = if (rot == 90 || rot == 270) rawH else rawW
+            val h = if (rot == 90 || rot == 270) rawW else rawH
+            if (h > 0f) (w / h).coerceIn(0.3f, 3.0f) else 9f / 16f
+        } catch (e: Exception) {
+            9f / 16f
+        }
+    }
+
+    fun removeWatermark(
         context: Context,
         inputUri: Uri,
         normRect: NormalizedRect,
-        onStatusUpdate: suspend (String) -> Unit,
-        onResult: suspend (Boolean, File?, String) -> Unit
-    ) = withContext(Dispatchers.IO) {
-        try {
-            onStatusUpdate("Preparing video file...")
-            val inputFile = File(context.cacheDir, "input_video.mp4")
-            context.contentResolver.openInputStream(inputUri)?.use { input ->
-                FileOutputStream(inputFile).use { output -> input.copyTo(output) }
+        onProgress: (Int, String) -> Unit,
+        onResult: (Boolean, File?, String) -> Unit
+    ) {
+        val mainHandler = Handler(Looper.getMainLooper())
+
+        Thread {
+            try {
+                mainHandler.post { onProgress(2, "Copying video file...") }
+
+                val inputFile = File(context.cacheDir, "input_video.mp4")
+                context.contentResolver.openInputStream(inputUri)?.use { input ->
+                    FileOutputStream(inputFile).use { output -> input.copyTo(output) }
+                }
+
+                val outputFile = File(context.getExternalFilesDir(null), "PixelFixer_${System.currentTimeMillis()}.mp4")
+
+                mainHandler.post { onProgress(5, "Reading video dimensions...") }
+
+                val retriever = MediaMetadataRetriever()
+                retriever.setDataSource(inputFile.absolutePath)
+                val rawWidth = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 1280
+                val rawHeight = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 720
+                val rotation = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
+                val durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 5000L
+                retriever.release()
+
+                // Account for portrait rotation metadata so coordinates match the visible video 1:1
+                val videoWidth = if (rotation == 90 || rotation == 270) rawHeight else rawWidth
+                val videoHeight = if (rotation == 90 || rotation == 270) rawWidth else rawHeight
+
+                // FFmpeg delogo requires at least a 2-pixel border inside the frame edges
+                val x = (normRect.leftPercent * videoWidth).toInt().coerceIn(2, max(4, videoWidth - 16))
+                val y = (normRect.topPercent * videoHeight).toInt().coerceIn(2, max(4, videoHeight - 16))
+                val w = (normRect.widthPercent * videoWidth).toInt().coerceIn(8, max(8, videoWidth - x - 4))
+                val h = (normRect.heightPercent * videoHeight).toInt().coerceIn(8, max(8, videoHeight - y - 4))
+
+                mainHandler.post { onProgress(10, "Erasing watermark (${w}x${h}px)...") }
+
+                // Use built-in mpeg4 encoder (-c:v mpeg4 -q:v 2) so it works on 100% of Android phones
+                val cmd = "-y -i \"${inputFile.absolutePath}\" -vf \"delogo=x=$x:y=$y:w=$w:h=$h:show=0\" -c:v mpeg4 -q:v 2 -c:a copy \"${outputFile.absolutePath}\""
+
+                FFmpegKit.executeAsync(
+                    cmd,
+                    { session ->
+                        if (ReturnCode.isSuccess(session.returnCode) && outputFile.exists() && outputFile.length() > 0) {
+                            val galleryMsg = saveToPhoneGallery(context, outputFile)
+                            mainHandler.post {
+                                onProgress(100, "100% Complete!")
+                                onResult(true, outputFile, galleryMsg)
+                            }
+                        } else {
+                            val logs = session.allLogsAsString ?: "Unknown FFmpeg error"
+                            val shortErr = if (logs.length > 250) logs.takeLast(250) else logs
+                            mainHandler.post {
+                                onResult(false, null, "FFmpeg Error:\n$shortErr")
+                            }
+                        }
+                    },
+                    { _ -> },
+                    { stats ->
+                        val processedMs = stats.time.toDouble()
+                        if (durationMs > 0 && processedMs > 0) {
+                            val rawPct = ((processedMs / durationMs.toDouble()) * 90.0).toInt()
+                            val pct = (10 + rawPct).coerceIn(10, 99)
+                            mainHandler.post {
+                                onProgress(pct, "Removing watermark... $pct%")
+                            }
+                        }
+                    }
+                )
+            } catch (e: Throwable) {
+                mainHandler.post {
+                    onResult(false, null, "Error: ${e.localizedMessage ?: "Failed to process video"}")
+                }
             }
+        }.start()
+    }
 
-            val outputFile = File(context.getExternalFilesDir(null), "cleaned_${System.currentTimeMillis()}.mp4")
-
-            onStatusUpdate("Analyzing video dimensions...")
-            val retriever = MediaMetadataRetriever()
-            retriever.setDataSource(context, inputUri)
-            val videoWidth = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toInt() ?: 1080
-            val videoHeight = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toInt() ?: 1920
-            retriever.release()
-
-            // Ultra-safe bounds checking (prevents FFmpeg native crash)
-            val x = max(2, (normRect.leftPercent * videoWidth).toInt())
-            val y = max(2, (normRect.topPercent * videoHeight).toInt())
-            val w = max(10, minOf((normRect.widthPercent * videoWidth).toInt(), videoWidth - x - 2))
-            val h = max(10, minOf((normRect.heightPercent * videoHeight).toInt(), videoHeight - y - 2))
-
-            onStatusUpdate("Removing watermark... This may take a minute.")
-            val cmd = "-y -i \"${inputFile.absolutePath}\" -vf \"delogo=x=$x:y=$y:w=$w:h=$h:show=0\" -c:a copy \"${outputFile.absolutePath}\""
-
-            // Run FFmpeg synchronously inside this IO Coroutine
-            val session = FFmpegKit.execute(cmd)
-            
-            if (ReturnCode.isSuccess(session.returnCode)) {
-                onResult(true, outputFile, "Success! Video saved.")
+    private fun saveToPhoneGallery(context: Context, videoFile: File): String {
+        return try {
+            val values = ContentValues().apply {
+                put(MediaStore.Video.Media.DISPLAY_NAME, videoFile.name)
+                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/PixelFixer")
+                    put(MediaStore.Video.Media.IS_PENDING, 1)
+                }
+            }
+            val resolver = context.contentResolver
+            val collection = MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+            val itemUri = resolver.insert(collection, values)
+            if (itemUri != null) {
+                resolver.openOutputStream(itemUri)?.use { outStream ->
+                    FileInputStream(videoFile).use { inStream ->
+                        inStream.copyTo(outStream)
+                    }
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    values.clear()
+                    values.put(MediaStore.Video.Media.IS_PENDING, 0)
+                    resolver.update(itemUri, values, null, null)
+                }
+                "Saved to Gallery (Movies/PixelFixer)!"
             } else {
-                val errorLog = session.failStackTrace ?: "Unknown FFmpeg error"
-                onResult(false, null, "Failed: $errorLog")
+                "Saved in App Studio!"
             }
-
-        } catch (e: Throwable) {
-            onResult(false, null, e.localizedMessage ?: "Fatal Error Occurred")
+        } catch (e: Exception) {
+            "Saved in App Studio: ${videoFile.name}"
         }
     }
 }
 
-// 3. Main Application Class
+// 3. Main Activity
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -113,7 +206,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-// 4. UI Screens
+// 4. App Navigation
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun WatermarkRemoverApp() {
@@ -177,7 +270,6 @@ fun WatermarkRemoverApp() {
                         VideoEditorScreen(
                             videoUri = selectedVideoUri!!,
                             onChangeVideo = { videoPicker.launch("video/*") },
-                            onOpenPaywall = { showPaywall = true },
                             onSuccess = { file ->
                                 processedVideos.add(0, file)
                                 currentTab = 1
@@ -205,10 +297,16 @@ fun HomeDashboard(onPickVideo: () -> Unit) {
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Icon(Icons.Default.MovieFilter, contentDescription = null, modifier = Modifier.size(80.dp), tint = MaterialTheme.colorScheme.primary)
+        Icon(
+            Icons.Default.MovieFilter,
+            contentDescription = null,
+            modifier = Modifier.size(80.dp),
+            tint = MaterialTheme.colorScheme.primary
+        )
         Spacer(Modifier.height(16.dp))
-        Text("PixelFixer Studio", fontSize = 24.sp, fontWeight = FontWeight.Bold)
-        Text("Erase watermarks & logos instantly.", color = Color.Gray)
+        Text("PixelFixer: Gemini & Video Eraser", fontSize = 22.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
+        Spacer(Modifier.height(8.dp))
+        Text("Select any Gemini or social video to remove its corner watermark.", color = Color.Gray, textAlign = TextAlign.Center)
         Spacer(Modifier.height(32.dp))
         Button(
             onClick = onPickVideo,
@@ -226,21 +324,22 @@ fun HomeDashboard(onPickVideo: () -> Unit) {
 fun VideoEditorScreen(
     videoUri: Uri,
     onChangeVideo: () -> Unit,
-    onOpenPaywall: () -> Unit,
     onSuccess: (File) -> Unit
 ) {
     val context = LocalContext.current
-    val coroutineScope = rememberCoroutineScope()
     var containerSize by remember { mutableStateOf(IntSize.Zero) }
+    val videoAspectRatio = remember(videoUri) { WatermarkProcessor.getVideoAspectRatio(context, videoUri) }
 
-    var boxLeft by remember { mutableFloatStateOf(0.15f) }
-    var boxTop by remember { mutableFloatStateOf(0.15f) }
-    var boxWidth by remember { mutableFloatStateOf(0.35f) }
+    // Default to Bottom-Right Corner (Standard Google Gemini Watermark Position)
+    var boxLeft by remember { mutableFloatStateOf(0.72f) }
+    var boxTop by remember { mutableFloatStateOf(0.86f) }
+    var boxWidth by remember { mutableFloatStateOf(0.26f) }
     var boxHeight by remember { mutableFloatStateOf(0.12f) }
 
     var isProcessing by remember { mutableStateOf(false) }
-    var statusMessage by remember { mutableStateOf("") }
-    var selectedMode by remember { mutableIntStateOf(0) }
+    var progressPercent by remember { mutableIntStateOf(0) }
+    var statusMessage by remember { mutableStateOf("Red box is set to Gemini Corner. Drag to adjust!") }
+    var errorDialogMessage by remember { mutableStateOf<String?>(null) }
 
     val exoPlayer = remember(videoUri) {
         ExoPlayer.Builder(context).build().apply {
@@ -255,107 +354,165 @@ fun VideoEditorScreen(
         onDispose { exoPlayer.release() }
     }
 
-    // Modal Progress Dialog to prevent clicking and show status
+    // Percentage Progress Dialog
     if (isProcessing) {
         AlertDialog(
-            onDismissRequest = { /* Do not allow dismiss */ },
+            onDismissRequest = { },
             confirmButton = {},
-            title = { Text("Processing Video") },
+            title = { Text("Removing Watermark...", fontWeight = FontWeight.Bold) },
             text = {
                 Column(
-                    modifier = Modifier.fillMaxWidth().padding(16.dp),
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    CircularProgressIndicator()
-                    Spacer(modifier = Modifier.height(16.dp))
-                    Text(statusMessage, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+                    Text(
+                        text = "$progressPercent%",
+                        fontSize = 36.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    LinearProgressIndicator(
+                        progress = (progressPercent / 100f).coerceIn(0f, 1f),
+                        modifier = Modifier.fillMaxWidth().height(10.dp)
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text(statusMessage, textAlign = TextAlign.Center, fontSize = 13.sp)
                 }
             }
         )
     }
 
-    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+    // Error Dialog (if anything goes wrong, you will see the exact reason)
+    if (errorDialogMessage != null) {
+        AlertDialog(
+            onDismissRequest = { errorDialogMessage = null },
+            confirmButton = {
+                Button(onClick = { errorDialogMessage = null }) { Text("OK") }
+            },
+            title = { Text("Processing Info") },
+            text = { Text(errorDialogMessage ?: "") }
+        )
+    }
+
+    Column(modifier = Modifier.fillMaxSize().padding(12.dp)) {
+        // Video + Locked Aspect-Ratio Overlay Box
         Box(
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth()
-                .background(Color.Black, RoundedCornerShape(12.dp))
-                .onSizeChanged { containerSize = it }
+                .background(Color(0xFF121212), RoundedCornerShape(12.dp)),
+            contentAlignment = Alignment.Center
         ) {
-            AndroidView(
-                factory = { ctx ->
-                    PlayerView(ctx).apply {
-                        player = exoPlayer
-                        useController = false
-                    }
-                },
-                modifier = Modifier.fillMaxSize()
-            )
-
-            Canvas(
+            Box(
                 modifier = Modifier
+                    .aspectRatio(videoAspectRatio)
                     .fillMaxSize()
-                    .pointerInput(Unit) {
-                        detectDragGestures { change, dragAmount ->
-                            change.consume()
-                            if (containerSize.width > 0 && containerSize.height > 0) {
-                                boxLeft = (boxLeft + dragAmount.x / containerSize.width).coerceIn(0.02f, 1f - boxWidth - 0.02f)
-                                boxTop = (boxTop + dragAmount.y / containerSize.height).coerceIn(0.02f, 1f - boxHeight - 0.02f)
+                    .onSizeChanged { containerSize = it }
+            ) {
+                AndroidView(
+                    factory = { ctx ->
+                        PlayerView(ctx).apply {
+                            player = exoPlayer
+                            useController = false
+                        }
+                    },
+                    modifier = Modifier.fillMaxSize()
+                )
+
+                Canvas(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .pointerInput(Unit) {
+                            detectDragGestures { change, dragAmount ->
+                                change.consume()
+                                if (containerSize.width > 0 && containerSize.height > 0) {
+                                    boxLeft = (boxLeft + dragAmount.x / containerSize.width)
+                                        .coerceIn(0.01f, max(0.01f, 0.99f - boxWidth))
+                                    boxTop = (boxTop + dragAmount.y / containerSize.height)
+                                        .coerceIn(0.01f, max(0.01f, 0.99f - boxHeight))
+                                }
                             }
                         }
-                    }
-            ) {
-                val rectLeft = boxLeft * size.width
-                val rectTop = boxTop * size.height
-                val rectW = boxWidth * size.width
-                val rectH = boxHeight * size.height
+                ) {
+                    val rectLeft = boxLeft * size.width
+                    val rectTop = boxTop * size.height
+                    val rectW = boxWidth * size.width
+                    val rectH = boxHeight * size.height
 
-                drawRect(
-                    color = Color.Red.copy(alpha = 0.25f),
-                    topLeft = Offset(rectLeft, rectTop),
-                    size = Size(rectW, rectH)
-                )
-                drawRect(
-                    color = Color.Red,
-                    topLeft = Offset(rectLeft, rectTop),
-                    size = Size(rectW, rectH),
-                    style = Stroke(width = 6f)
-                )
+                    drawRect(
+                        color = Color.Red.copy(alpha = 0.30f),
+                        topLeft = Offset(rectLeft, rectTop),
+                        size = Size(rectW, rectH)
+                    )
+                    drawRect(
+                        color = Color.Red,
+                        topLeft = Offset(rectLeft, rectTop),
+                        size = Size(rectW, rectH),
+                        style = Stroke(width = 6f)
+                    )
+                }
             }
         }
 
-        Spacer(Modifier.height(12.dp))
-        Text("Adjust Selection Box Size", fontSize = 12.sp, color = Color.Gray)
+        Spacer(Modifier.height(10.dp))
+
+        // Quick Preset Buttons for Gemini Watermark
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            FilledTonalButton(
+                onClick = {
+                    // Bottom-Right Gemini Watermark Preset
+                    boxWidth = 0.26f
+                    boxHeight = 0.12f
+                    boxLeft = 0.72f
+                    boxTop = 0.86f
+                    statusMessage = "Snapped to Bottom-Right Gemini Watermark!"
+                },
+                modifier = Modifier.weight(1f)
+            ) {
+                Text("🎯 Gemini (Bottom-Right)", fontSize = 12.sp)
+            }
+            FilledTonalButton(
+                onClick = {
+                    // Top-Right Preset
+                    boxWidth = 0.26f
+                    boxHeight = 0.12f
+                    boxLeft = 0.72f
+                    boxTop = 0.03f
+                    statusMessage = "Snapped to Top-Right Corner!"
+                },
+                modifier = Modifier.weight(1f)
+            ) {
+                Text("Top-Right Corner", fontSize = 12.sp)
+            }
+        }
+
+        Spacer(Modifier.height(6.dp))
+        Text("Box Width & Height:", fontSize = 12.sp, color = Color.Gray)
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             Slider(
                 value = boxWidth,
-                onValueChange = { boxWidth = it.coerceIn(0.05f, 1f - boxLeft - 0.02f) },
+                onValueChange = {
+                    boxWidth = it.coerceIn(0.05f, 0.95f)
+                    if (boxLeft + boxWidth > 0.99f) boxLeft = (0.99f - boxWidth).coerceAtLeast(0.01f)
+                },
                 modifier = Modifier.weight(1f)
             )
             Slider(
                 value = boxHeight,
-                onValueChange = { boxHeight = it.coerceIn(0.05f, 1f - boxTop - 0.02f) },
+                onValueChange = {
+                    boxHeight = it.coerceIn(0.05f, 0.95f)
+                    if (boxTop + boxHeight > 0.99f) boxTop = (0.99f - boxHeight).coerceAtLeast(0.01f)
+                },
                 modifier = Modifier.weight(1f)
             )
         }
 
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            FilterChip(
-                selected = selectedMode == 0,
-                onClick = { selectedMode = 0 },
-                label = { Text("Standard Clean (Free)") }
-            )
-            FilterChip(
-                selected = selectedMode == 1,
-                onClick = {
-                    selectedMode = 1
-                    onOpenPaywall()
-                },
-                label = { Text("✨ AI Inpaint (PRO)") }
-            )
-        }
-
-        Spacer(Modifier.height(16.dp))
+        Text(statusMessage, fontSize = 12.sp, color = MaterialTheme.colorScheme.secondary)
+        Spacer(Modifier.height(8.dp))
 
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             OutlinedButton(onClick = onChangeVideo, modifier = Modifier.weight(1f)) {
@@ -364,29 +521,29 @@ fun VideoEditorScreen(
             Button(
                 enabled = !isProcessing,
                 onClick = {
-                    // Pause the video player to free up RAM before FFmpeg starts
                     exoPlayer.pause()
                     isProcessing = true
-                    statusMessage = "Starting process..."
-                    
-                    coroutineScope.launch {
-                        WatermarkProcessor.removeWatermark(
-                            context = context,
-                            inputUri = videoUri,
-                            normRect = NormalizedRect(boxLeft, boxTop, boxWidth, boxHeight),
-                            onStatusUpdate = { msg ->
-                                // Update UI text safely
-                                withContext(Dispatchers.Main) { statusMessage = msg }
-                            },
-                            onResult = { success, file, msg ->
-                                withContext(Dispatchers.Main) {
-                                    isProcessing = false
-                                    if (success && file != null) onSuccess(file)
-                                    // If failed, we might want to show a toast, but for now we just close the dialog
-                                }
+                    progressPercent = 1
+                    statusMessage = "Starting watermark removal..."
+
+                    WatermarkProcessor.removeWatermark(
+                        context = context,
+                        inputUri = videoUri,
+                        normRect = NormalizedRect(boxLeft, boxTop, boxWidth, boxHeight),
+                        onProgress = { pct, msg ->
+                            progressPercent = pct
+                            statusMessage = msg
+                        },
+                        onResult = { success, file, msg ->
+                            isProcessing = false
+                            statusMessage = msg
+                            if (success && file != null) {
+                                onSuccess(file)
+                            } else {
+                                errorDialogMessage = msg
                             }
-                        )
-                    }
+                        }
+                    )
                 },
                 modifier = Modifier.weight(1f)
             ) {
@@ -396,19 +553,89 @@ fun VideoEditorScreen(
     }
 }
 
+// 5. My Studio Screen with Built-in Video Player to Verify Cleaned Video Immediately
 @Composable
 fun StudioGalleryScreen(files: List<File>) {
-    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        Text("Processed Videos", fontSize = 20.sp, fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(12.dp))
+    val context = LocalContext.current
+    var selectedFile by remember { mutableStateOf(files.firstOrNull()) }
+
+    LaunchedEffect(files.size) {
+        if (files.isNotEmpty()) {
+            selectedFile = files.first()
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp)
+            .verticalScroll(rememberScrollState())
+    ) {
+        Text("My Studio (Cleaned Videos)", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(8.dp))
+
         if (files.isEmpty()) {
-            Text("No videos cleaned yet. Go to the Editor tab to process your first video!", color = Color.Gray)
+            Text(
+                "No videos cleaned yet. Go to the Editor tab, select a Gemini video, and tap Remove Watermark!",
+                color = Color.Gray
+            )
         } else {
+            Text(
+                "✅ Also saved to your phone's Gallery under Movies/PixelFixer!",
+                color = Color(0xFF4CAF50),
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold
+            )
+            Spacer(Modifier.height(12.dp))
+
+            // Preview Player for the Cleaned Video
+            selectedFile?.let { file ->
+                val previewPlayer = remember(file.absolutePath) {
+                    ExoPlayer.Builder(context).build().apply {
+                        setMediaItem(MediaItem.fromUri(Uri.fromFile(file)))
+                        repeatMode = ExoPlayer.REPEAT_MODE_ALL
+                        prepare()
+                        playWhenReady = true
+                    }
+                }
+                DisposableEffect(previewPlayer) {
+                    onDispose { previewPlayer.release() }
+                }
+
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Text("Now Playing Cleaned Video:", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                        Spacer(Modifier.height(8.dp))
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(320.dp)
+                                .background(Color.Black, RoundedCornerShape(8.dp))
+                        ) {
+                            AndroidView(
+                                factory = { ctx ->
+                                    PlayerView(ctx).apply {
+                                        player = previewPlayer
+                                        useController = true
+                                    }
+                                },
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        }
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
+            Text("Processed History:", fontWeight = FontWeight.Bold)
             files.forEach { file ->
-                Card(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
-                    Column(modifier = Modifier.padding(16.dp)) {
+                Card(
+                    onClick = { selectedFile = file },
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
                         Text(file.name, fontWeight = FontWeight.Bold)
-                        Text("Saved to: ${file.absolutePath}", fontSize = 12.sp, color = Color.Gray)
+                        Text("Tap to preview above", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
                     }
                 }
             }
@@ -428,6 +655,130 @@ fun ProPlanScreen() {
         Spacer(Modifier.height(20.dp))
         Button(onClick = { }, modifier = Modifier.fillMaxWidth()) {
             Text("Start 3-Day Free Trial (Then ₹299/month)")
+        }
+    }
+}
+
+// 5. My Studio Screen with Video Preview + "Save to Any Folder" Picker
+@Composable
+fun StudioGalleryScreen(files: List<File>) {
+    val context = LocalContext.current
+    var selectedFile by remember { mutableStateOf(files.firstOrNull()) }
+    var saveStatusText by remember { mutableStateOf("✅ Auto-saved to Gallery (Movies/PixelFixer)") }
+
+    // Android System Folder & File Picker ("Save As...")
+    val saveToCustomFolderLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("video/mp4")
+    ) { destinationUri: Uri? ->
+        if (destinationUri != null && selectedFile != null) {
+            try {
+                context.contentResolver.openOutputStream(destinationUri)?.use { outStream ->
+                    FileInputStream(selectedFile!!).use { inStream ->
+                        inStream.copyTo(outStream)
+                    }
+                }
+                saveStatusText = "✅ Successfully saved to your chosen folder!"
+                android.widget.Toast.makeText(context, "Saved to selected folder!", android.widget.Toast.LENGTH_LONG).show()
+            } catch (e: Exception) {
+                saveStatusText = "❌ Failed to save: ${e.localizedMessage}"
+            }
+        }
+    }
+
+    LaunchedEffect(files.size) {
+        if (files.isNotEmpty()) {
+            selectedFile = files.first()
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp)
+            .verticalScroll(rememberScrollState())
+    ) {
+        Text("My Studio (Cleaned Videos)", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(8.dp))
+
+        if (files.isEmpty()) {
+            Text(
+                "No videos cleaned yet. Go to the Editor tab, select a Gemini video, and tap Remove Watermark!",
+                color = Color.Gray
+            )
+        } else {
+            Text(
+                saveStatusText,
+                color = Color(0xFF4CAF50),
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold
+            )
+            Spacer(Modifier.height(12.dp))
+
+            // Preview Player for the Cleaned Video
+            selectedFile?.let { file ->
+                val previewPlayer = remember(file.absolutePath) {
+                    ExoPlayer.Builder(context).build().apply {
+                        setMediaItem(MediaItem.fromUri(Uri.fromFile(file)))
+                        repeatMode = ExoPlayer.REPEAT_MODE_ALL
+                        prepare()
+                        playWhenReady = true
+                    }
+                }
+                DisposableEffect(previewPlayer) {
+                    onDispose { previewPlayer.release() }
+                }
+
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Text("Now Playing Cleaned Video:", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                        Spacer(Modifier.height(8.dp))
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(320.dp)
+                                .background(Color.Black, RoundedCornerShape(8.dp))
+                        ) {
+                            AndroidView(
+                                factory = { ctx ->
+                                    PlayerView(ctx).apply {
+                                        player = previewPlayer
+                                        useController = true
+                                    }
+                                },
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        }
+
+                        Spacer(Modifier.height(12.dp))
+
+                        // Button to pick ANY folder on the phone and save the video there
+                        Button(
+                            onClick = {
+                                saveToCustomFolderLauncher.launch(file.name)
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Icon(Icons.Default.FolderOpen, contentDescription = null)
+                            Spacer(Modifier.width(8.dp))
+                            Text("Save Video to Any Folder...")
+                        }
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
+            Text("Processed History:", fontWeight = FontWeight.Bold)
+            files.forEach { file ->
+                Card(
+                    onClick = { selectedFile = file },
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Text(file.name, fontWeight = FontWeight.Bold)
+                        Text("Tap to preview or save", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
+                    }
+                }
+            }
         }
     }
 }
