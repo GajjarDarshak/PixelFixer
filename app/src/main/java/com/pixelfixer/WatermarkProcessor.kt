@@ -9,14 +9,13 @@ import java.io.File
 import java.io.FileOutputStream
 
 data class NormalizedRect(
-    val leftPercent: Float,   // 0.0f to 1.0f
-    val topPercent: Float,    // 0.0f to 1.0f
-    val widthPercent: Float,  // 0.0f to 1.0f
-    val heightPercent: Float  // 0.0f to 1.0f
+    val leftPercent: Float,
+    val topPercent: Float,
+    val widthPercent: Float,
+    val heightPercent: Float
 )
 
 object WatermarkProcessor {
-
     fun removeWatermark(
         context: Context,
         inputUri: Uri,
@@ -25,7 +24,6 @@ object WatermarkProcessor {
         onResult: (Boolean, File?, String) -> Unit
     ) {
         try {
-            // 1. Copy URI to local temp file for FFmpeg access
             val inputFile = File(context.cacheDir, "input_video.mp4")
             context.contentResolver.openInputStream(inputUri)?.use { input ->
                 FileOutputStream(inputFile).use { output -> input.copyTo(output) }
@@ -33,20 +31,17 @@ object WatermarkProcessor {
 
             val outputFile = File(context.getExternalFilesDir(null), "cleaned_${System.currentTimeMillis()}.mp4")
 
-            // 2. Read actual video pixel dimensions
             val retriever = MediaMetadataRetriever()
             retriever.setDataSource(context, inputUri)
             val videoWidth = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toInt() ?: 1080
             val videoHeight = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toInt() ?: 1920
             retriever.release()
 
-            // 3. Map UI box percentages to real video pixels (clamped safely within bounds)
             val x = (normRect.leftPercent * videoWidth).toInt().coerceIn(2, videoWidth - 20)
             val y = (normRect.topPercent * videoHeight).toInt().coerceIn(2, videoHeight - 20)
             val w = (normRect.widthPercent * videoWidth).toInt().coerceIn(10, videoWidth - x - 2)
             val h = (normRect.heightPercent * videoHeight).toInt().coerceIn(10, videoHeight - y - 2)
 
-            // 4. Execute FFmpeg delogo filter
             val cmd = "-y -i \"${inputFile.absolutePath}\" -vf \"delogo=x=$x:y=$y:w=$w:h=$h:show=0\" -c:a copy \"${outputFile.absolutePath}\""
 
             FFmpegKit.executeAsync(cmd, { session ->
