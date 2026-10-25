@@ -69,6 +69,8 @@ import androidx.media3.ui.PlayerView
 import java.io.File
 import java.io.FileInputStream
 import kotlin.math.max
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 
 // 1. Watermark Selection Area (0.0 to 1.0)
 data class NormalizedRect(
@@ -83,6 +85,15 @@ data class ProcessedVideo(
     val file: File,
     val shareUri: Uri?
 )
+
+fun formatDurationMs(durationMs: Long): String {
+    if (durationMs <= 0L) return "00:00.00"
+    val totalHundredths = durationMs / 10L
+    val minutes = totalHundredths / 6000L
+    val seconds = (totalHundredths % 6000L) / 100L
+    val hundredths = totalHundredths % 100L
+    return "%02d:%02d.%02d".format(minutes, seconds, hundredths)
+}
 
 // 3. Per-Frame OpenGL GPU Watermark Eraser (Zero Box, Feathered Live Inpainting)
 class DelogoGlEffect(
@@ -592,6 +603,30 @@ fun VideoEditorScreen(
         }
     }
 
+    val videoDurationMs = remember(videoUri) { exoPlayer.duration.takeIf { it > 0L } ?: 0L }
+    var currentPositionMs by remember { mutableLongStateOf(0L) }
+    var selectionStartMs by remember(videoUri) { mutableLongStateOf(0L) }
+    var selectionEndMs by remember(videoUri) { mutableLongStateOf(0L) }
+
+    LaunchedEffect(videoUri, videoDurationMs) {
+        if (videoDurationMs > 0L) {
+            if (selectionStartMs <= 0L && selectionEndMs <= 0L) {
+                selectionStartMs = 0L
+                selectionEndMs = videoDurationMs
+            }
+            if (selectionEndMs <= selectionStartMs || selectionEndMs > videoDurationMs) {
+                selectionEndMs = videoDurationMs
+            }
+        }
+    }
+
+    LaunchedEffect(exoPlayer) {
+        while (isActive) {
+            currentPositionMs = exoPlayer.currentPosition
+            delay(120L)
+        }
+    }
+
     DisposableEffect(exoPlayer) {
         onDispose { exoPlayer.release() }
     }
@@ -693,6 +728,123 @@ fun VideoEditorScreen(
                         cornerRadius = CornerRadius(rectW * 0.35f, rectH * 0.35f),
                         style = Stroke(width = 5f)
                     )
+                }
+            }
+        }
+
+        Spacer(Modifier.height(8.dp))
+
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+        ) {
+            Column(
+                modifier = Modifier.fillMaxWidth().padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Video Editor Bar", fontWeight = FontWeight.Bold)
+                    Text(
+                        text = "${formatDurationMs(currentPositionMs)} / ${formatDurationMs(videoDurationMs)}",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+
+                if (videoDurationMs > 0L) {
+                    Slider(
+                        value = selectionStartMs.toFloat(),
+                        onValueChange = {
+                            val value = it.toLong().coerceIn(0L, videoDurationMs)
+                            selectionStartMs = value
+                            if (selectionEndMs <= selectionStartMs) {
+                                selectionEndMs = (selectionStartMs + 1000L).coerceAtMost(videoDurationMs)
+                            }
+                            exoPlayer.seekTo(selectionStartMs)
+                        },
+                        valueRange = 0f..videoDurationMs.toFloat(),
+                    )
+
+                    Slider(
+                        value = selectionEndMs.toFloat(),
+                        onValueChange = {
+                            val value = it.toLong().coerceIn(0L, videoDurationMs)
+                            selectionEndMs = value
+                            if (selectionEndMs <= selectionStartMs) {
+                                selectionStartMs = (selectionEndMs - 1000L).coerceAtLeast(0L)
+                            }
+                        },
+                        valueRange = selectionStartMs.toFloat()..videoDurationMs.toFloat(),
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text("Start: ${formatDurationMs(selectionStartMs)}", fontSize = 12.sp)
+                    Text("Stop: ${formatDurationMs(selectionEndMs)}", fontSize = 12.sp)
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Button(
+                        onClick = {
+                            exoPlayer.seekTo(selectionStartMs.coerceAtMost(videoDurationMs))
+                            exoPlayer.play()
+                            statusMessage = "Playing from selected start time."
+                        },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Play")
+                    }
+                    Button(
+                        onClick = {
+                            exoPlayer.pause()
+                            statusMessage = "Video paused."
+                        },
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)
+                    ) {
+                        Text("Pause")
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = {
+                            selectionStartMs = currentPositionMs.coerceAtMost(videoDurationMs)
+                            if (selectionEndMs <= selectionStartMs) {
+                                selectionEndMs = (selectionStartMs + 1000L).coerceAtMost(videoDurationMs)
+                            }
+                            exoPlayer.seekTo(selectionStartMs)
+                            statusMessage = "Start point set to ${formatDurationMs(selectionStartMs)}."
+                        },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Set Start")
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            selectionEndMs = currentPositionMs.coerceAtLeast(selectionStartMs).coerceAtMost(videoDurationMs)
+                            if (selectionEndMs <= selectionStartMs) {
+                                selectionEndMs = (selectionStartMs + 1000L).coerceAtMost(videoDurationMs)
+                            }
+                            statusMessage = "Stop point set to ${formatDurationMs(selectionEndMs)}."
+                        },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Set Stop")
+                    }
                 }
             }
         }
@@ -939,7 +1091,7 @@ fun StudioGalleryScreen(videos: List<ProcessedVideo>) {
                             }
                         }
 
-                        Spacer(Modifier.height(8.dp))
+                        Spacer(modifier = Modifier.height(8.dp))
 
                         // Save to Any Folder + General Share Row
                         Row(
@@ -998,9 +1150,13 @@ fun ProPlanScreen() {
         Text("• Batch Process up to 20 Reels/Shorts at once")
         Text("• 4K 60fps Original Quality Export")
         Text("• 100% Ad-Free Experience")
-        Spacer(Modifier.height(20.dp))
-        Button(onClick = { }, modifier = Modifier.fillMaxWidth()) {
-            Text("Start 3-Day Free Trial (Then ₹299/month)")
+        Spacer(Modifier.height(24.dp))
+        Button(
+            onClick = { },
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFFB300))
+        ) {
+            Text("Upgrade to PRO", color = Color.Black, fontWeight = FontWeight.Bold)
         }
     }
 }
