@@ -5,6 +5,7 @@
 
 package com.pixelfixer
 
+import android.app.Activity
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
@@ -66,11 +67,21 @@ import androidx.media3.transformer.ExportResult
 import androidx.media3.transformer.ProgressHolder
 import androidx.media3.transformer.Transformer
 import androidx.media3.ui.PlayerView
+import com.google.android.gms.ads.AdError
+import com.google.android.gms.ads.AdRequest
+import com.google.android.gms.ads.FullScreenContentCallback
+import com.google.android.gms.ads.LoadAdError
+import com.google.android.gms.ads.MobileAds
+import com.google.android.gms.ads.interstitial.InterstitialAd
+import com.google.android.gms.ads.interstitial.InterstitialAdLoadCallback
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlin.math.max
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 
 // 1. Watermark Selection Area (0.0 to 1.0)
 data class NormalizedRect(
@@ -80,25 +91,220 @@ data class NormalizedRect(
     val heightPercent: Float
 )
 
-// 2. Processed Video Item (File + Shareable MediaStore URI for WhatsApp/Instagram)
+// 2. Persistent Processed Video History Item
 data class ProcessedVideo(
     val file: File,
-    val shareUri: Uri?
+    val shareUri: Uri?,
+    val timestamp: Long = file.lastModified(),
+    val modeName: String = "Seamless Erase"
 )
 
-fun formatDurationMs(durationMs: Long): String {
-    if (durationMs <= 0L) return "00:00.00"
-    val totalHundredths = durationMs / 10L
-    val minutes = totalHundredths / 6000L
-    val seconds = (totalHundredths % 6000L) / 100L
-    val hundredths = totalHundredths % 100L
-    return "%02d:%02d.%02d".format(minutes, seconds, hundredths)
+// 3. Local Phone Storage Manager (Saves History & Edit Count Permanently on Device)
+object LocalHistoryManager {
+    private const val PREFS_NAME = "pixelfixer_local_store"
+    private const val KEY_EDIT_COUNT = "total_edits_count"
+    private const val KEY_HISTORY_JSON = "saved_video_history"
+
+    fun getEditCount(context: Context): Int {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        return prefs.getInt(KEY_EDIT_COUNT, 0)
+    }
+
+    fun incrementEditCount(context: Context): Int {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val next = prefs.getInt(KEY_EDIT_COUNT, 0) + 1
+        prefs.edit().putInt(KEY_EDIT_COUNT, next).apply()
+        return next
+    }
+
+    fun saveVideoEntry(context: Context, video: ProcessedVideo) {
+        val currentList = loadHistory(context).toMutableList()
+        currentList.removeAll { it.file.absolutePath == video.file.absolutePath }
+        currentList.add(0, video)
+        persistList(context, currentList)
+    }
+
+    fun deleteVideoEntry(context: Context, video: ProcessedVideo): List<ProcessedVideo> {
+        try {
+            if (video.file.exists()) video.file.delete()
+        } catch (_: Exception) {}
+        val currentList = loadHistory(context).toMutableList()
+        currentList.removeAll { it.file.absolutePath == video.file.absolutePath }
+        persistList(context, currentList)
+        return currentList
+    }
+
+    fun loadHistory(context: Context): List<ProcessedVideo> {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val rawJson = prefs.getString(KEY_HISTORY_JSON, null)
+        val loaded = mutableListOf<ProcessedVideo>()
+        val seenPaths = mutableSetOf<String>()
+
+        if (!rawJson.isNullOrEmpty()) {
+            try {
+                val arr = JSONArray(rawJson)
+                for (i in 0 until arr.length()) {
+                    val obj = arr.getJSONObject(i)
+                    val path = obj.optString("path")
+                    val uriStr = obj.optString("uri", "")
+                    val time = obj.optLong("timestamp", System.currentTimeMillis())
+                    val mode = obj.optString("mode", "Seamless Erase")
+                    val f = File(path)
+                    if (f.exists() && f.length() > 0 && seenPaths.add(f.absolutePath)) {
+                        val parsedUri = if (uriStr.isNotEmpty()) Uri.parse(uriStr) else null
+                        loaded.add(ProcessedVideo(f, parsedUri, time, mode))
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+
+        // Also scan the app's local storage folder so no previously cleaned video is ever lost
+        val dir = context.getExternalFilesDir(null)
+        val diskFiles = dir?.listFiles { file ->
+            file.isFile && file.name.startsWith("PixelFixer_") && file.name.endsWith(".mp4") && file.length() > 0
+        }?.sortedByDescending { it.lastModified() } ?: emptyList()
+
+        for (f in diskFiles) {
+            if (seenPaths.add(f.absolutePath)) {
+                loaded.add(ProcessedVideo(f, null, f.lastModified(), "Seamless Erase"))
+            }
+        }
+
+        return loaded.sortedByDescending { it.timestamp }
+    }
+
+    private fun persistList(context: Context, list: List<ProcessedVideo>) {
+        val arr = JSONArray()
+        for (item in list) {
+            if (item.file.exists()) {
+                val obj = JSONObject().apply {
+                    put("path", item.file.absolutePath)
+                    put("uri", item.shareUri?.toString() ?: "")
+                    put("timestamp", item.timestamp)
+                    put("mode", item.modeName)
+                }
+                arr.put(obj)
+            }
+        }
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_HISTORY_JSON, arr.toString())
+            .apply()
+    }
 }
 
-// 3. Per-Frame OpenGL GPU Watermark Eraser (Zero Box, Feathered Live Inpainting)
+// 4. Google AdMob Manager (Preloads & Shows Interstitial Ad on 2nd+ Video Edit)
+object AdMobManager {
+    // Official Google AdMob Test Interstitial ID (Shows real test ads safely during validation)
+    private const val INTERSTITIAL_AD_UNIT_ID = "ca-app-pub-3940256099942544/1033173712"
+    private var interstitialAd: InterstitialAd? = null
+    private var isLoadingAd = false
+
+    fun initializeAndPreload(context: Context) {
+        try {
+            MobileAds.initialize(context) {
+                preloadAd(context)
+            }
+        } catch (_: Exception) {}
+    }
+
+    fun preloadAd(context: Context) {
+        if (interstitialAd != null || isLoadingAd) return
+        isLoadingAd = true
+        val adRequest = AdRequest.Builder().build()
+        InterstitialAd.load(
+            context.applicationContext,
+            INTERSTITIAL_AD_UNIT_ID,
+            adRequest,
+            object : InterstitialAdLoadCallback() {
+                override fun onAdLoaded(ad: InterstitialAd) {
+                    interstitialAd = ad
+                    isLoadingAd = false
+                }
+
+                override fun onAdFailedToLoad(error: LoadAdError) {
+                    interstitialAd = null
+                    isLoadingAd = false
+                }
+            }
+        )
+    }
+
+    fun showAdThenRun(
+        activity: Activity,
+        onAdStatus: (String) -> Unit,
+        onContinueToProcess: () -> Unit
+    ) {
+        val readyAd = interstitialAd
+        if (readyAd != null) {
+            readyAd.fullScreenContentCallback = object : FullScreenContentCallback() {
+                override fun onAdDismissedFullScreenContent() {
+                    interstitialAd = null
+                    preloadAd(activity)
+                    onContinueToProcess()
+                }
+
+                override fun onAdFailedToShowFullScreenContent(adError: AdError) {
+                    interstitialAd = null
+                    preloadAd(activity)
+                    onContinueToProcess()
+                }
+            }
+            readyAd.show(activity)
+        } else {
+            // If the ad wasn't preloaded yet, load it on the spot (with a 4-second timeout so the user never gets stuck)
+            onAdStatus("Loading Google Ad before 2nd+ video edit...")
+            var finished = false
+            val mainHandler = Handler(Looper.getMainLooper())
+
+            val timeoutRunnable = Runnable {
+                if (!finished) {
+                    finished = true
+                    onContinueToProcess()
+                }
+            }
+            mainHandler.postDelayed(timeoutRunnable, 4000L)
+
+            val adRequest = AdRequest.Builder().build()
+            InterstitialAd.load(
+                activity.applicationContext,
+                INTERSTITIAL_AD_UNIT_ID,
+                adRequest,
+                object : InterstitialAdLoadCallback() {
+                    override fun onAdLoaded(ad: InterstitialAd) {
+                        if (finished) return
+                        finished = true
+                        mainHandler.removeCallbacks(timeoutRunnable)
+                        ad.fullScreenContentCallback = object : FullScreenContentCallback() {
+                            override fun onAdDismissedFullScreenContent() {
+                                preloadAd(activity)
+                                onContinueToProcess()
+                            }
+
+                            override fun onAdFailedToShowFullScreenContent(adError: AdError) {
+                                preloadAd(activity)
+                                onContinueToProcess()
+                            }
+                        }
+                        ad.show(activity)
+                    }
+
+                    override fun onAdFailedToLoad(error: LoadAdError) {
+                        if (finished) return
+                        finished = true
+                        mainHandler.removeCallbacks(timeoutRunnable)
+                        onContinueToProcess()
+                    }
+                }
+            )
+        }
+    }
+}
+
+// 5. Per-Frame OpenGL GPU Watermark Eraser (Zero Box, Feathered Live Inpainting)
 class DelogoGlEffect(
     private val normRect: NormalizedRect,
-    private val removalMode: Int // 0 = Seamless Feather Erase, 1 = Smart Corner Zoom
+    private val removalMode: Int
 ) : GlEffect {
     override fun toGlShaderProgram(context: Context, useHdr: Boolean): BaseGlShaderProgram {
         return DelogoShaderProgram(useHdr, normRect, removalMode)
@@ -122,7 +328,6 @@ class DelogoShaderProgram(
                 GlUtil.HOMOGENEOUS_COORDINATE_VECTOR_SIZE
             )
 
-            // Convert UI top-left coordinates (0..1) to OpenGL bottom-left UV coordinates (0..1)
             val glLeft = normRect.leftPercent.coerceIn(0.005f, 0.98f)
             val glRight = (normRect.leftPercent + normRect.widthPercent).coerceIn(glLeft + 0.02f, 0.995f)
             val glTop = (1f - normRect.topPercent).coerceIn(0.02f, 0.995f)
@@ -172,10 +377,6 @@ class DelogoShaderProgram(
             }
         """
 
-        // Per-frame GPU Inpainting Shader:
-        // - Samples clean pixels outside the watermark on EVERY frame
-        // - Automatically ignores screen edges when erasing corner watermarks (like Gemini)
-        // - Uses an elliptical smoothstep feather so there is NEVER a visible box outline
         private const val FRAGMENT_SHADER = """
             precision highp float;
             varying vec2 vTexSamplingCoord;
@@ -196,7 +397,6 @@ class DelogoShaderProgram(
             void main() {
                 vec2 uv = vTexSamplingCoord;
 
-                // Mode 1: Smart Corner Zoom (pushes corner watermark outside frame with 0% blur)
                 if (uMode > 0.5) {
                     float boxW = uRight - uLeft;
                     float boxH = uTop - uBottom;
@@ -210,7 +410,6 @@ class DelogoShaderProgram(
                     return;
                 }
 
-                // Mode 0: Seamless Per-Frame Feathered Inpaint
                 vec4 origColor = texture2D(uTexSampler, uv);
 
                 if (uv.x < uLeft || uv.x > uRight || uv.y < uBottom || uv.y > uTop) {
@@ -223,7 +422,6 @@ class DelogoShaderProgram(
                 float u = clamp((uv.x - uLeft) / w, 0.0, 1.0);
                 float v = clamp((uv.y - uBottom) / h, 0.0, 1.0);
 
-                // Sample clean background just outside the box
                 float pad = 0.008;
                 float lX = max(0.003, uLeft - pad);
                 float rX = min(0.997, uRight + pad);
@@ -236,14 +434,11 @@ class DelogoShaderProgram(
                 vec4 colTop    = sampleSmoothBorder(vec2(uv.x, tY), vec2(1.0, 0.0), w * 0.18);
                 vec4 colDiagTL = texture2D(uTexSampler, vec2(lX, tY));
 
-                // Inverse distance weights
                 float wL = 1.0 / pow(max(0.03, u), 1.35);
                 float wR = 1.0 / pow(max(0.03, 1.0 - u), 1.35);
                 float wB = 1.0 / pow(max(0.03, v), 1.35);
                 float wT = 1.0 / pow(max(0.03, 1.0 - v), 1.35);
 
-                // If the box is at the edge/corner of the screen (e.g. Gemini bottom-right),
-                // disable sampling from the screen edge so only clean interior video is used!
                 if (uLeft < 0.03)   wL *= 0.02;
                 if (uRight > 0.97)  wR *= 0.02;
                 if (uBottom < 0.03) wB *= 0.02;
@@ -252,9 +447,8 @@ class DelogoShaderProgram(
                 float totalW = wL + wR + wB + wT + 0.35;
                 vec4 inpainted = (colLeft * wL + colRight * wR + colBottom * wB + colTop * wT + colDiagTL * 0.35) / totalW;
 
-                // Soft elliptical feather mask: fades smoothly at the edges so no box outline is visible
                 vec2 centered = vec2((u - 0.5) * 2.0, (v - 0.5) * 2.0);
-                float roundedDist = length(centered * centered * centered); // Super-ellipse shape
+                float roundedDist = length(centered * centered * centered);
                 float featherMask = 1.0 - smoothstep(0.45, 1.0, roundedDist);
 
                 gl_FragColor = mix(origColor, inpainted, featherMask);
@@ -263,7 +457,7 @@ class DelogoShaderProgram(
     }
 }
 
-// 4. Video Processor Manager
+// 6. Video Processor Manager
 object WatermarkProcessor {
 
     fun getVideoAspectRatio(context: Context, uri: Uri): Float {
@@ -291,12 +485,11 @@ object WatermarkProcessor {
         onResult: (Boolean, ProcessedVideo?, String) -> Unit
     ) {
         val mainHandler = Handler(Looper.getMainLooper())
-
-        val outputFile = File(
-            context.getExternalFilesDir(null),
-            "PixelFixer_${System.currentTimeMillis()}.mp4"
-        )
+        val now = System.currentTimeMillis()
+        val outputFile = File(context.getExternalFilesDir(null), "PixelFixer_$now.mp4")
         if (outputFile.exists()) outputFile.delete()
+
+        val modeTitle = if (removalMode == 1) "Smart Edge Zoom" else "Seamless Erase"
 
         mainHandler.post {
             try {
@@ -317,12 +510,22 @@ object WatermarkProcessor {
                             isFinished = true
                             Thread {
                                 val galleryUri = saveToPhoneGallery(context, outputFile)
+                                val processedItem = ProcessedVideo(
+                                    file = outputFile,
+                                    shareUri = galleryUri,
+                                    timestamp = now,
+                                    modeName = modeTitle
+                                )
+                                // Save permanently in phone local storage history
+                                LocalHistoryManager.saveVideoEntry(context, processedItem)
+                                LocalHistoryManager.incrementEditCount(context)
+
                                 mainHandler.post {
                                     onProgress(100, "100% Complete!")
                                     onResult(
                                         true,
-                                        ProcessedVideo(outputFile, galleryUri),
-                                        "Saved to Gallery (Movies/PixelFixer)!"
+                                        processedItem,
+                                        "Saved to Local History & Gallery (Movies/PixelFixer)!"
                                     )
                                 }
                             }.start()
@@ -422,7 +625,6 @@ object WatermarkProcessor {
                     if (targetPackage != null) intent else Intent.createChooser(intent, "Share Cleaned Video")
                 )
             } catch (e: Exception) {
-                // If WhatsApp or Instagram isn't installed, fall back to the universal system share sheet
                 val fallbackIntent = Intent(Intent.ACTION_SEND).apply {
                     type = "video/mp4"
                     putExtra(Intent.EXTRA_STREAM, contentUri)
@@ -436,28 +638,40 @@ object WatermarkProcessor {
     }
 }
 
-// 5. Main Activity
+// 7. Main Activity
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Initialize Google AdMob & preload the ad in the background
+        AdMobManager.initializeAndPreload(this)
+
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
-                WatermarkRemoverApp()
+                WatermarkRemoverApp(activity = this)
             }
         }
     }
 }
 
-// 6. Main App Navigation
+// 8. Main App Navigation (Loads Persistent Local History on Startup)
 @Composable
-fun WatermarkRemoverApp() {
+fun WatermarkRemoverApp(activity: ComponentActivity) {
+    val context = LocalContext.current
     var currentTab by remember { mutableIntStateOf(0) }
     var selectedVideoUri by remember { mutableStateOf<Uri?>(null) }
-    val processedVideos = remember { mutableStateListOf<ProcessedVideo>() }
+
+    // Load saved edit history from the user's phone storage immediately on launch
+    val processedVideos = remember {
+        mutableStateListOf<ProcessedVideo>().apply {
+            addAll(LocalHistoryManager.loadHistory(context))
+        }
+    }
+    var totalEditsDone by remember { mutableIntStateOf(LocalHistoryManager.getEditCount(context)) }
     var showPaywall by remember { mutableStateOf(false) }
 
     val videoPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri != null) {
+            // Reset and set the new video URI so the Editor refreshes immediately
             selectedVideoUri = uri
             currentTab = 0
         }
@@ -466,7 +680,17 @@ fun WatermarkRemoverApp() {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("PixelFixer", fontWeight = FontWeight.Bold) },
+                title = {
+                    Column {
+                        Text("PixelFixer", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                        Text(
+                            if (totalEditsDone == 0) "1st Video Edit: 100% Ad-Free ✨"
+                            else "Edits Completed: $totalEditsDone",
+                            fontSize = 11.sp,
+                            color = Color(0xFF80CBC4)
+                        )
+                    }
+                },
                 actions = {
                     Button(
                         onClick = { showPaywall = true },
@@ -490,8 +714,8 @@ fun WatermarkRemoverApp() {
                 NavigationBarItem(
                     selected = currentTab == 1,
                     onClick = { currentTab = 1 },
-                    icon = { Icon(Icons.Default.VideoLibrary, null) },
-                    label = { Text("My Studio (${processedVideos.size})") }
+                    icon = { Icon(Icons.Default.History, null) },
+                    label = { Text("My History (${processedVideos.size})") }
                 )
                 NavigationBarItem(
                     selected = currentTab == 2,
@@ -506,19 +730,35 @@ fun WatermarkRemoverApp() {
             when (currentTab) {
                 0 -> {
                     if (selectedVideoUri == null) {
-                        HomeDashboard(onPickVideo = { videoPicker.launch("video/*") })
+                        HomeDashboard(
+                            totalEditsDone = totalEditsDone,
+                            historyCount = processedVideos.size,
+                            onPickVideo = { videoPicker.launch("video/*") },
+                            onOpenHistory = { currentTab = 1 }
+                        )
                     } else {
                         VideoEditorScreen(
+                            activity = activity,
                             videoUri = selectedVideoUri!!,
+                            totalEditsDone = totalEditsDone,
                             onChangeVideo = { videoPicker.launch("video/*") },
                             onSuccess = { processedVideo ->
+                                processedVideos.removeAll { it.file.absolutePath == processedVideo.file.absolutePath }
                                 processedVideos.add(0, processedVideo)
+                                totalEditsDone = LocalHistoryManager.getEditCount(context)
                                 currentTab = 1
                             }
                         )
                     }
                 }
-                1 -> StudioGalleryScreen(processedVideos)
+                1 -> StudioGalleryScreen(
+                    videos = processedVideos,
+                    onDeleteVideo = { toDelete ->
+                        val updated = LocalHistoryManager.deleteVideoEntry(context, toDelete)
+                        processedVideos.clear()
+                        processedVideos.addAll(updated)
+                    }
+                )
                 2 -> ProPlanScreen()
             }
         }
@@ -532,7 +772,12 @@ fun WatermarkRemoverApp() {
 }
 
 @Composable
-fun HomeDashboard(onPickVideo: () -> Unit) {
+fun HomeDashboard(
+    totalEditsDone: Int,
+    historyCount: Int,
+    onPickVideo: () -> Unit,
+    onOpenHistory: () -> Unit
+) {
     Column(
         modifier = Modifier.fillMaxSize().padding(24.dp),
         verticalArrangement = Arrangement.Center,
@@ -553,7 +798,8 @@ fun HomeDashboard(onPickVideo: () -> Unit) {
         )
         Spacer(Modifier.height(8.dp))
         Text(
-            "Real-Time GPU Watermark Eraser. Removes corner watermarks smoothly without adding boxes.",
+            if (totalEditsDone == 0) "Your first video watermark removal is 100% Ad-Free!"
+            else "Select any video to erase its watermark. All edits are saved in your phone's local history.",
             color = Color.Gray,
             textAlign = TextAlign.Center
         )
@@ -567,33 +813,51 @@ fun HomeDashboard(onPickVideo: () -> Unit) {
             Spacer(Modifier.width(8.dp))
             Text("Select Video from Gallery", fontSize = 16.sp)
         }
+
+        if (historyCount > 0) {
+            Spacer(Modifier.height(12.dp))
+            OutlinedButton(
+                onClick = onOpenHistory,
+                modifier = Modifier.fillMaxWidth().height(48.dp),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Icon(Icons.Default.History, contentDescription = null)
+                Spacer(Modifier.width(8.dp))
+                Text("View Saved Edit History ($historyCount)")
+            }
+        }
     }
 }
 
 @Composable
 fun VideoEditorScreen(
+    activity: ComponentActivity,
     videoUri: Uri,
+    totalEditsDone: Int,
     onChangeVideo: () -> Unit,
     onSuccess: (ProcessedVideo) -> Unit
 ) {
     val context = LocalContext.current
-    var containerSize by remember { mutableStateOf(IntSize.Zero) }
+    var containerSize by remember(videoUri) { mutableStateOf(IntSize.Zero) }
     val videoAspectRatio = remember(videoUri) { WatermarkProcessor.getVideoAspectRatio(context, videoUri) }
 
-    // Tighter default fit for the Google Gemini bottom-right sparkle/logo
-    var boxLeft by remember { mutableFloatStateOf(0.78f) }
-    var boxTop by remember { mutableFloatStateOf(0.88f) }
-    var boxWidth by remember { mutableFloatStateOf(0.20f) }
-    var boxHeight by remember { mutableFloatStateOf(0.10f) }
-
-    // 0 = Seamless GPU Erase (Feathered), 1 = Smart Corner Zoom (100% Zero Blur)
+    var boxLeft by remember(videoUri) { mutableFloatStateOf(0.78f) }
+    var boxTop by remember(videoUri) { mutableFloatStateOf(0.88f) }
+    var boxWidth by remember(videoUri) { mutableFloatStateOf(0.20f) }
+    var boxHeight by remember(videoUri) { mutableFloatStateOf(0.10f) }
     var removalMode by remember { mutableIntStateOf(0) }
 
     var isProcessing by remember { mutableStateOf(false) }
     var progressPercent by remember { mutableIntStateOf(0) }
-    var statusMessage by remember { mutableStateOf("Place the rounded target tightly over the Gemini logo.") }
+    var statusMessage by remember(videoUri) {
+        mutableStateOf(
+            if (totalEditsDone == 0) "1st Edit (No Ads): Place target over the Gemini logo."
+            else "2nd+ Edit: A short Google Ad will play before processing."
+        )
+    }
     var errorDialogMessage by remember { mutableStateOf<String?>(null) }
 
+    // Recreate ExoPlayer whenever videoUri changes
     val exoPlayer = remember(videoUri) {
         ExoPlayer.Builder(context).build().apply {
             setMediaItem(MediaItem.fromUri(videoUri))
@@ -603,32 +867,11 @@ fun VideoEditorScreen(
         }
     }
 
-    val videoDurationMs = remember(videoUri) { exoPlayer.duration.takeIf { it > 0L } ?: 0L }
-    var currentPositionMs by remember { mutableLongStateOf(0L) }
-    var selectionStartMs by remember(videoUri) { mutableLongStateOf(0L) }
-    var selectionEndMs by remember(videoUri) { mutableLongStateOf(0L) }
-
-    LaunchedEffect(videoUri, videoDurationMs) {
-        if (videoDurationMs > 0L) {
-            if (selectionStartMs <= 0L && selectionEndMs <= 0L) {
-                selectionStartMs = 0L
-                selectionEndMs = videoDurationMs
-            }
-            if (selectionEndMs <= selectionStartMs || selectionEndMs > videoDurationMs) {
-                selectionEndMs = videoDurationMs
-            }
+    DisposableEffect(videoUri) {
+        onDispose {
+            exoPlayer.stop()
+            exoPlayer.release()
         }
-    }
-
-    LaunchedEffect(exoPlayer) {
-        while (isActive) {
-            currentPositionMs = exoPlayer.currentPosition
-            delay(120L)
-        }
-    }
-
-    DisposableEffect(exoPlayer) {
-        onDispose { exoPlayer.release() }
     }
 
     if (isProcessing) {
@@ -670,6 +913,33 @@ fun VideoEditorScreen(
         )
     }
 
+    // Helper that starts the actual GPU watermark removal
+    val startVideoProcessing = {
+        isProcessing = true
+        progressPercent = 1
+        statusMessage = "Starting GPU Watermark Eraser..."
+
+        WatermarkProcessor.removeWatermark(
+            context = context,
+            inputUri = videoUri,
+            normRect = NormalizedRect(boxLeft, boxTop, boxWidth, boxHeight),
+            removalMode = removalMode,
+            onProgress = { pct, msg ->
+                progressPercent = pct
+                statusMessage = msg
+            },
+            onResult = { success, processedVideo, msg ->
+                isProcessing = false
+                statusMessage = msg
+                if (success && processedVideo != null) {
+                    onSuccess(processedVideo)
+                } else {
+                    errorDialogMessage = msg
+                }
+            }
+        )
+    }
+
     Column(modifier = Modifier.fillMaxSize().padding(12.dp)) {
         Box(
             modifier = Modifier
@@ -684,21 +954,28 @@ fun VideoEditorScreen(
                     .fillMaxSize()
                     .onSizeChanged { containerSize = it }
             ) {
-                AndroidView(
-                    factory = { ctx ->
-                        PlayerView(ctx).apply {
-                            player = exoPlayer
-                            useController = false
-                        }
-                    },
-                    modifier = Modifier.fillMaxSize()
-                )
+                // FIXED: key(videoUri) + update block forces PlayerView to switch to the new video immediately!
+                key(videoUri) {
+                    AndroidView(
+                        factory = { ctx ->
+                            PlayerView(ctx).apply {
+                                player = exoPlayer
+                                useController = false
+                            }
+                        },
+                        update = { playerView ->
+                            if (playerView.player !== exoPlayer) {
+                                playerView.player = exoPlayer
+                            }
+                        },
+                        modifier = Modifier.fillMaxSize()
+                    )
+                }
 
-                // Rounded Target Overlay (shows exact feathered erase zone)
                 Canvas(
                     modifier = Modifier
                         .fillMaxSize()
-                        .pointerInput(Unit) {
+                        .pointerInput(videoUri) {
                             detectDragGestures { change, dragAmount ->
                                 change.consume()
                                 if (containerSize.width > 0 && containerSize.height > 0) {
@@ -734,124 +1011,6 @@ fun VideoEditorScreen(
 
         Spacer(Modifier.height(8.dp))
 
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
-        ) {
-            Column(
-                modifier = Modifier.fillMaxWidth().padding(12.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text("Video Editor Bar", fontWeight = FontWeight.Bold)
-                    Text(
-                        text = "${formatDurationMs(currentPositionMs)} / ${formatDurationMs(videoDurationMs)}",
-                        fontSize = 12.sp,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                }
-
-                if (videoDurationMs > 0L) {
-                    Slider(
-                        value = selectionStartMs.toFloat(),
-                        onValueChange = {
-                            val value = it.toLong().coerceIn(0L, videoDurationMs)
-                            selectionStartMs = value
-                            if (selectionEndMs <= selectionStartMs) {
-                                selectionEndMs = (selectionStartMs + 1000L).coerceAtMost(videoDurationMs)
-                            }
-                            exoPlayer.seekTo(selectionStartMs)
-                        },
-                        valueRange = 0f..videoDurationMs.toFloat(),
-                    )
-
-                    Slider(
-                        value = selectionEndMs.toFloat(),
-                        onValueChange = {
-                            val value = it.toLong().coerceIn(0L, videoDurationMs)
-                            selectionEndMs = value
-                            if (selectionEndMs <= selectionStartMs) {
-                                selectionStartMs = (selectionEndMs - 1000L).coerceAtLeast(0L)
-                            }
-                        },
-                        valueRange = selectionStartMs.toFloat()..videoDurationMs.toFloat(),
-                    )
-                }
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Text("Start: ${formatDurationMs(selectionStartMs)}", fontSize = 12.sp)
-                    Text("Stop: ${formatDurationMs(selectionEndMs)}", fontSize = 12.sp)
-                }
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Button(
-                        onClick = {
-                            exoPlayer.seekTo(selectionStartMs.coerceAtMost(videoDurationMs))
-                            exoPlayer.play()
-                            statusMessage = "Playing from selected start time."
-                        },
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text("Play")
-                    }
-                    Button(
-                        onClick = {
-                            exoPlayer.pause()
-                            statusMessage = "Video paused."
-                        },
-                        modifier = Modifier.weight(1f),
-                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)
-                    ) {
-                        Text("Pause")
-                    }
-                }
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    OutlinedButton(
-                        onClick = {
-                            selectionStartMs = currentPositionMs.coerceAtMost(videoDurationMs)
-                            if (selectionEndMs <= selectionStartMs) {
-                                selectionEndMs = (selectionStartMs + 1000L).coerceAtMost(videoDurationMs)
-                            }
-                            exoPlayer.seekTo(selectionStartMs)
-                            statusMessage = "Start point set to ${formatDurationMs(selectionStartMs)}."
-                        },
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text("Set Start")
-                    }
-                    OutlinedButton(
-                        onClick = {
-                            selectionEndMs = currentPositionMs.coerceAtLeast(selectionStartMs).coerceAtMost(videoDurationMs)
-                            if (selectionEndMs <= selectionStartMs) {
-                                selectionEndMs = (selectionStartMs + 1000L).coerceAtMost(videoDurationMs)
-                            }
-                            statusMessage = "Stop point set to ${formatDurationMs(selectionEndMs)}."
-                        },
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text("Set Stop")
-                    }
-                }
-            }
-        }
-
-        Spacer(Modifier.height(8.dp))
-
-        // Removal Mode Selector
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -876,7 +1035,6 @@ fun VideoEditorScreen(
             )
         }
 
-        // Quick Corner Presets
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -933,50 +1091,45 @@ fun VideoEditorScreen(
 
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             OutlinedButton(onClick = onChangeVideo, modifier = Modifier.weight(1f)) {
-                Text("Change Video")
+                Text("Select Another Video")
             }
             Button(
                 enabled = !isProcessing,
                 onClick = {
                     exoPlayer.pause()
-                    isProcessing = true
-                    progressPercent = 1
-                    statusMessage = "Starting GPU Watermark Eraser..."
 
-                    WatermarkProcessor.removeWatermark(
-                        context = context,
-                        inputUri = videoUri,
-                        normRect = NormalizedRect(boxLeft, boxTop, boxWidth, boxHeight),
-                        removalMode = removalMode,
-                        onProgress = { pct, msg ->
-                            progressPercent = pct
-                            statusMessage = msg
-                        },
-                        onResult = { success, processedVideo, msg ->
-                            isProcessing = false
-                            statusMessage = msg
-                            if (success && processedVideo != null) {
-                                onSuccess(processedVideo)
-                            } else {
-                                errorDialogMessage = msg
-                            }
-                        }
-                    )
+                    // 1st Video Edit (totalEditsDone == 0): NO AD! Process immediately.
+                    // 2nd+ Video Edit (totalEditsDone >= 1): Show Google Ad first, then process!
+                    val currentCount = LocalHistoryManager.getEditCount(context)
+                    if (currentCount == 0) {
+                        startVideoProcessing()
+                    } else {
+                        statusMessage = "Opening Google Ad for 2nd+ edit..."
+                        AdMobManager.showAdThenRun(
+                            activity = activity,
+                            onAdStatus = { msg -> statusMessage = msg },
+                            onContinueToProcess = { startVideoProcessing() }
+                        )
+                    }
                 },
                 modifier = Modifier.weight(1f)
             ) {
-                Text("Remove Watermark")
+                Text(if (totalEditsDone == 0) "Remove Watermark" else "Watch Ad & Remove")
             }
         }
     }
 }
 
-// 7. My Studio Screen with Video Player + WhatsApp, Instagram & Save Folder Buttons
+// 9. My History & Studio Screen (Persists Across App Restarts + Delete + Share)
 @Composable
-fun StudioGalleryScreen(videos: List<ProcessedVideo>) {
+fun StudioGalleryScreen(
+    videos: List<ProcessedVideo>,
+    onDeleteVideo: (ProcessedVideo) -> Unit
+) {
     val context = LocalContext.current
-    var selectedVideo by remember { mutableStateOf(videos.firstOrNull()) }
-    var saveStatusText by remember { mutableStateOf("✅ Auto-saved to Gallery (Movies/PixelFixer)") }
+    var selectedVideo by remember(videos.size) { mutableStateOf(videos.firstOrNull()) }
+    var saveStatusText by remember { mutableStateOf("✅ All edits are saved in your phone's Local History & Gallery") }
+    val dateFormat = remember { SimpleDateFormat("dd MMM yyyy, hh:mm a", Locale.getDefault()) }
 
     val saveToCustomFolderLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("video/mp4")
@@ -996,24 +1149,18 @@ fun StudioGalleryScreen(videos: List<ProcessedVideo>) {
         }
     }
 
-    LaunchedEffect(videos.size) {
-        if (videos.isNotEmpty()) {
-            selectedVideo = videos.first()
-        }
-    }
-
     Column(
         modifier = Modifier
             .fillMaxSize()
             .padding(16.dp)
             .verticalScroll(rememberScrollState())
     ) {
-        Text("My Studio (Cleaned Videos)", fontSize = 20.sp, fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(8.dp))
+        Text("My Local Edit History (${videos.size})", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(6.dp))
 
         if (videos.isEmpty()) {
             Text(
-                "No videos cleaned yet. Go to the Editor tab, select a Gemini video, and tap Remove Watermark!",
+                "No edited videos in history yet. Go to the Editor tab to clean your first video (1st edit is 100% Ad-Free!).",
                 color = Color.Gray
             )
         } else {
@@ -1034,13 +1181,21 @@ fun StudioGalleryScreen(videos: List<ProcessedVideo>) {
                         playWhenReady = true
                     }
                 }
-                DisposableEffect(previewPlayer) {
-                    onDispose { previewPlayer.release() }
+                DisposableEffect(video.file.absolutePath) {
+                    onDispose {
+                        previewPlayer.stop()
+                        previewPlayer.release()
+                    }
                 }
 
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Column(modifier = Modifier.padding(12.dp)) {
-                        Text("Now Playing Cleaned Video:", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                        Text("Now Playing: ${video.file.name}", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                        Text(
+                            "Edited: ${dateFormat.format(Date(video.timestamp))} • Mode: ${video.modeName}",
+                            fontSize = 11.sp,
+                            color = Color.Gray
+                        )
                         Spacer(Modifier.height(8.dp))
                         Box(
                             modifier = Modifier
@@ -1048,20 +1203,26 @@ fun StudioGalleryScreen(videos: List<ProcessedVideo>) {
                                 .height(320.dp)
                                 .background(Color.Black, RoundedCornerShape(8.dp))
                         ) {
-                            AndroidView(
-                                factory = { ctx ->
-                                    PlayerView(ctx).apply {
-                                        player = previewPlayer
-                                        useController = true
-                                    }
-                                },
-                                modifier = Modifier.fillMaxSize()
-                            )
+                            key(video.file.absolutePath) {
+                                AndroidView(
+                                    factory = { ctx ->
+                                        PlayerView(ctx).apply {
+                                            player = previewPlayer
+                                            useController = true
+                                        }
+                                    },
+                                    update = { playerView ->
+                                        if (playerView.player !== previewPlayer) {
+                                            playerView.player = previewPlayer
+                                        }
+                                    },
+                                    modifier = Modifier.fillMaxSize()
+                                )
+                            }
                         }
 
                         Spacer(Modifier.height(12.dp))
 
-                        // 1-Tap WhatsApp & Instagram Share Buttons
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -1091,9 +1252,8 @@ fun StudioGalleryScreen(videos: List<ProcessedVideo>) {
                             }
                         }
 
-                        Spacer(modifier = Modifier.height(8.dp))
+                        Spacer(Modifier.height(8.dp))
 
-                        // Save to Any Folder + General Share Row
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -1125,15 +1285,35 @@ fun StudioGalleryScreen(videos: List<ProcessedVideo>) {
             }
 
             Spacer(Modifier.height(16.dp))
-            Text("Processed History:", fontWeight = FontWeight.Bold)
+            Text("All Saved Edits on This Phone:", fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(6.dp))
+
             videos.forEach { video ->
+                val isSelected = selectedVideo?.file?.absolutePath == video.file.absolutePath
                 Card(
                     onClick = { selectedVideo = video },
+                    colors = CardDefaults.cardColors(
+                        containerColor = if (isSelected) MaterialTheme.colorScheme.secondaryContainer
+                        else MaterialTheme.colorScheme.surfaceVariant
+                    ),
                     modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
                 ) {
-                    Column(modifier = Modifier.padding(12.dp)) {
-                        Text(video.file.name, fontWeight = FontWeight.Bold)
-                        Text("Tap to preview or share", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(video.file.name, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                            Text(
+                                "${dateFormat.format(Date(video.timestamp))} • ${video.modeName}",
+                                fontSize = 12.sp,
+                                color = Color.Gray
+                            )
+                        }
+                        IconButton(onClick = { onDeleteVideo(video) }) {
+                            Icon(Icons.Default.Delete, contentDescription = "Delete", tint = Color(0xFFEF5350))
+                        }
                     }
                 }
             }
@@ -1146,17 +1326,13 @@ fun ProPlanScreen() {
     Column(modifier = Modifier.fillMaxWidth().padding(24.dp)) {
         Text("Unlock PixelFixer PRO ✨", fontSize = 24.sp, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(12.dp))
+        Text("• 100% Ad-Free Unlimited Video Edits")
         Text("• Cloud AI Generative Inpainting")
         Text("• Batch Process up to 20 Reels/Shorts at once")
         Text("• 4K 60fps Original Quality Export")
-        Text("• 100% Ad-Free Experience")
-        Spacer(Modifier.height(24.dp))
-        Button(
-            onClick = { },
-            modifier = Modifier.fillMaxWidth(),
-            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFFB300))
-        ) {
-            Text("Upgrade to PRO", color = Color.Black, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(20.dp))
+        Button(onClick = { }, modifier = Modifier.fillMaxWidth()) {
+            Text("Start 3-Day Free Trial (Then ₹299/month)")
         }
     }
 }
