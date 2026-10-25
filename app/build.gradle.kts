@@ -11,8 +11,8 @@ android {
         applicationId = "com.pixelfixer"
         minSdk = 24
         targetSdk = 34
-        versionCode = 2
-        versionName = "2.0"
+        versionCode = 3
+        versionName = "3.0"
     }
 
     buildFeatures {
@@ -42,10 +42,13 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.8.2")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.7.0")
 
-    // Official Google Media3 Video Player + Hardware Video Transformer & Effects
+    // Official Google Media3 Video Player & GPU Transformer
     implementation("androidx.media3:media3-exoplayer:1.2.1")
     implementation("androidx.media3:media3-ui:1.2.1")
     implementation("androidx.media3:media3-transformer:1.2.1")
     implementation("androidx.media3:media3-effect:1.2.1")
     implementation("androidx.media3:media3-common:1.2.1")
+
+    // Official Google AdMob SDK
+    implementation("com.google.android.gms:play-services-ads:23.0.0")
 }
